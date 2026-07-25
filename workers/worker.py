@@ -174,8 +174,14 @@ async def run_pipeline(ctx: dict, job_id: str) -> str:
             stage_id = await _create_stage_record(pool, job_id, stage_name)
 
             try:
-                # Run the stage handler (in Phase 1, pass the provider pool and db pool!)
-                output = await stage_handler(job_id, {"provider_pool": ctx["provider_pool"]})
+                # Run the stage handler (in Phase 1, pass the provider default components)
+                output = await stage_handler(
+                    job_id, 
+                    {
+                        "provider_pool": ctx["provider_pool"],
+                        "db_pool": pool
+                    }
+                )
 
                 # Persist output
                 await _complete_stage(pool, stage_id, output)
