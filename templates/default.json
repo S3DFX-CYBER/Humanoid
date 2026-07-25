@@ -1,0 +1,38 @@
+{
+  "id": "default",
+  "name": "Default University Template",
+  "description": "Standard academic paper format",
+  "page": {
+    "size": "letter",
+    "margins": {
+      "top": "1in",
+      "bottom": "1in",
+      "left": "1in",
+      "right": "1in"
+    }
+  },
+  "fonts": {
+    "body": "Times New Roman",
+    "bodySize": 12,
+    "heading": "Times New Roman",
+    "headingSize": 14
+  },
+  "spacing": {
+    "lineSpacing": 2.0,
+    "paragraphSpacing": 0
+  },
+  "titlePage": {
+    "enabled": true,
+    "fields": ["title", "author", "institution", "course", "date"]
+  },
+  "toc": {
+    "enabled": true,
+    "depth": 3
+  },
+  "citationStyles": ["apa", "mla", "chicago", "ieee"],
+  "headers": {
+    "enabled": true,
+    "includePageNumber": true,
+    "pageNumberPosition": "top-right"
+  }
+}
