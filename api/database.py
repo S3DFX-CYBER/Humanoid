@@ -27,22 +27,34 @@ async def close_pool() -> None:
         _pool = None
 
 
-async def fetch_one(query: str, *args) -> asyncpg.Record | None:
-    """Execute a query and return a single row."""
+async def fetch_one(query: str, *args, user_id: str | None = None) -> asyncpg.Record | None:
+    """Execute a query and return a single row, optionally setting RLS context."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if user_id:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL jwt.claims.sub = '{user_id}'")
+                return await conn.fetchrow(query, *args)
         return await conn.fetchrow(query, *args)
 
 
-async def fetch_all(query: str, *args) -> list[asyncpg.Record]:
-    """Execute a query and return all rows."""
+async def fetch_all(query: str, *args, user_id: str | None = None) -> list[asyncpg.Record]:
+    """Execute a query and return all rows, optionally setting RLS context."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if user_id:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL jwt.claims.sub = '{user_id}'")
+                return await conn.fetch(query, *args)
         return await conn.fetch(query, *args)
 
 
-async def execute(query: str, *args) -> str:
-    """Execute a query and return the status string."""
+async def execute(query: str, *args, user_id: str | None = None) -> str:
+    """Execute a query and return the status string, optionally setting RLS context."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if user_id:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL jwt.claims.sub = '{user_id}'")
+                return await conn.execute(query, *args)
         return await conn.execute(query, *args)

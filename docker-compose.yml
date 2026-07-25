@@ -16,7 +16,7 @@ services:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U humanoid"]
+      test: [ "CMD-SHELL", "pg_isready -U humanoid" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -26,7 +26,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -78,6 +78,11 @@ services:
     ports:
       - "8001:8001"
     # No DB or Redis access — isolated by design
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   render:
     build:
@@ -86,6 +91,11 @@ services:
     ports:
       - "8002:8002"
     # No DB or Redis access — isolated by design
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:

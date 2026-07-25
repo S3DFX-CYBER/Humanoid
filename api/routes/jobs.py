@@ -65,6 +65,32 @@ async def create_job(
     user_id: str = Depends(get_current_user),
 ):
     """Create a new job and enqueue it for the arq worker."""
+    settings = get_settings()
+
+    # Rate limiting: Check concurrent active jobs
+    active_jobs = await fetch_one(
+        "SELECT COUNT(*) as count FROM jobs WHERE user_id = $1 AND status NOT IN ('done', 'failed')",
+        uuid.UUID(user_id),
+        user_id=user_id,
+    )
+    if active_jobs and active_jobs["count"] >= settings.max_concurrent_jobs_per_user:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Exceeded maximum concurrent jobs ({settings.max_concurrent_jobs_per_user}). Please wait for current jobs to finish.",
+        )
+
+    # Rate limiting: Check daily quota
+    daily_jobs = await fetch_one(
+        "SELECT COUNT(*) as count FROM jobs WHERE user_id = $1 AND created_at > now() - interval '1 day'",
+        uuid.UUID(user_id),
+        user_id=user_id,
+    )
+    if daily_jobs and daily_jobs["count"] >= settings.max_daily_jobs_per_user:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Exceeded daily job limit ({settings.max_daily_jobs_per_user}). Please try again tomorrow.",
+        )
+
     job_id = uuid.uuid4()
 
     row = await fetch_one(
@@ -78,6 +104,7 @@ async def create_job(
         body.topic,
         body.citation_style,
         body.config,
+        user_id=user_id,
     )
 
     if row is None:
@@ -100,6 +127,7 @@ async def get_job(job_id: str, current_user: str = Depends(get_current_user)):
         "SELECT * FROM jobs WHERE id = $1 AND user_id = $2",
         uuid.UUID(job_id),
         uuid.UUID(current_user),
+        user_id=current_user,
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -114,6 +142,7 @@ async def get_job_stages(job_id: str, current_user: str = Depends(get_current_us
         "SELECT id FROM jobs WHERE id = $1 AND user_id = $2",
         uuid.UUID(job_id),
         uuid.UUID(current_user),
+        user_id=current_user,
     )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -125,5 +154,6 @@ async def get_job_stages(job_id: str, current_user: str = Depends(get_current_us
         ORDER BY started_at ASC NULLS LAST
         """,
         uuid.UUID(job_id),
+        user_id=current_user,
     )
     return [StageResponse(**_record_to_dict(r)) for r in rows]

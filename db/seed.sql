@@ -2,6 +2,15 @@
 -- NOTE: In production, users are created via Supabase Auth.
 -- This seed bypasses RLS (run as superuser) for dev convenience.
 
+DO $$
+BEGIN
+    -- Basic heuristic guard: abort if running on a hosted Supabase environment
+    -- Local instances usually have a default database 'humanoid' or 'postgres'
+    IF current_setting('server_version') ILIKE '%supabase%' THEN
+        RAISE EXCEPTION 'Refusing to run dev seed script against a production Supabase instance.';
+    END IF;
+END $$;
+
 INSERT INTO users (id, email) VALUES
     ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'dev@humanoid.local');
 

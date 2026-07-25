@@ -4,6 +4,24 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ============================================================
+-- DEV ENVIRONMENT MOCK FOR SUPABASE RLS
+-- ============================================================
+-- Supabase includes `auth.uid()`, pure Postgres does not.
+-- This block safely creates the schema and function only if it's missing,
+-- stubbing it to read our custom session variable `jwt.claims.sub`.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc JOIN pg_namespace ON pg_proc.pronamespace = pg_namespace.oid 
+        WHERE pg_namespace.nspname = 'auth' AND pg_proc.proname = 'uid'
+    ) THEN
+        CREATE SCHEMA IF NOT EXISTS auth;
+        EXECUTE 'CREATE FUNCTION auth.uid() RETURNS uuid AS $func$ SELECT NULLIF(current_setting(''jwt.claims.sub'', true), '''')::uuid; $func$ LANGUAGE SQL STABLE;';
+    END IF;
+END $$;
+
+-- ============================================================
 -- ENUMS
 -- ============================================================
 

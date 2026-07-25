@@ -174,8 +174,8 @@ async def run_pipeline(ctx: dict, job_id: str) -> str:
             stage_id = await _create_stage_record(pool, job_id, stage_name)
 
             try:
-                # Run the stage handler (in Phase 0, these are stubs)
-                output = await stage_handler(job_id, {})
+                # Run the stage handler (in Phase 1, pass the provider pool and db pool!)
+                output = await stage_handler(job_id, {"provider_pool": ctx["provider_pool"]})
 
                 # Persist output
                 await _complete_stage(pool, stage_id, output)
@@ -208,10 +208,13 @@ async def run_pipeline(ctx: dict, job_id: str) -> str:
         raise
 
 
+from providers import get_provider_pool
+
 async def startup(ctx: dict) -> None:
     """Worker startup hook — initialize shared resources."""
     logger.info("[worker] Starting up...")
     await _get_db_pool(ctx)
+    ctx["provider_pool"] = get_provider_pool()
 
 
 async def shutdown(ctx: dict) -> None:
