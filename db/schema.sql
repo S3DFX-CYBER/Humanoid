@@ -8,7 +8,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================================
 -- Supabase includes `auth.uid()`, pure Postgres does not.
 -- This block safely creates the schema and function only if it's missing,
--- stubbing it to read our custom session variable `jwt.claims.sub`.
+-- stubbing it to read Supabase's real session variable `request.jwt.claim.sub`.
 
 DO $$
 BEGIN
@@ -17,7 +17,7 @@ BEGIN
         WHERE pg_namespace.nspname = 'auth' AND pg_proc.proname = 'uid'
     ) THEN
         CREATE SCHEMA IF NOT EXISTS auth;
-        EXECUTE 'CREATE FUNCTION auth.uid() RETURNS uuid AS $func$ SELECT NULLIF(current_setting(''jwt.claims.sub'', true), '''')::uuid; $func$ LANGUAGE SQL STABLE;';
+        EXECUTE 'CREATE FUNCTION auth.uid() RETURNS uuid AS $func$ SELECT NULLIF(current_setting(''request.jwt.claim.sub'', true), '''')::uuid; $func$ LANGUAGE SQL STABLE;';
     END IF;
 END $$;
 

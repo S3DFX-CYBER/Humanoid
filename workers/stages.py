@@ -1,8 +1,8 @@
-"""Pipeline stage handler stubs.
+"""Pipeline stage handlers.
 
-Each stage is an async function that receives the job context and
-produces output. In Phase 0 these are no-ops — real logic comes in
-later phases.
+Research, outline, draft, verify, style, and format jobs by reading and
+writing stage outputs. Some downstream integrations are still placeholders,
+but the core research/draft/verify stages perform real provider-backed work.
 
 Stage order:
   researching → outlining → drafting → verifying → styling → formatting
@@ -17,6 +17,7 @@ import json
 import uuid
 from providers.search import get_search_results, fetch_and_extract_text
 from providers.embedding import generate_embedding
+from api.database import set_rls_context
 
 async def run_research(job_id: str, input_data: dict) -> dict:
     """Stage 1: Research sources for the given topic."""
@@ -75,7 +76,7 @@ async def run_research(job_id: str, input_data: dict) -> dict:
             # 5. Store in Postgres via db_pool (inject RLS context explicitly)
             async with db_pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.execute(f"SET LOCAL jwt.claims.sub = '{user_id}'")
+                    await set_rls_context(conn, user_id)
                     await conn.execute(
                         """
                         INSERT INTO sources (job_id, url, title, content_text, source_type, embedding)
@@ -110,7 +111,7 @@ async def run_outline(job_id: str, input_data: dict) -> dict:
         # We also need the content from the sources found in standard user contexts
         # We will use the user context for RLS
         async with conn.transaction():
-            await conn.execute(f"SET LOCAL jwt.claims.sub = '{job['user_id']}'")
+            await set_rls_context(conn, job["user_id"])
             sources = await conn.fetch(
                 "SELECT title, content_text FROM sources WHERE job_id = $1 LIMIT 5",
                 uuid.UUID(job_id)
@@ -170,7 +171,7 @@ async def run_draft(job_id: str, input_data: dict) -> dict:
         job = await conn.fetchrow("SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id))
         
         async with conn.transaction():
-            await conn.execute(f"SET LOCAL jwt.claims.sub = '{job['user_id']}'")
+            await set_rls_context(conn, job["user_id"])
             
             # 1. Fetch Outline from previous stage
             outline_row = await conn.fetchrow(
@@ -243,7 +244,7 @@ async def run_verify(job_id: str, input_data: dict) -> dict:
         job = await conn.fetchrow("SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id))
         
         async with conn.transaction():
-            await conn.execute(f"SET LOCAL jwt.claims.sub = '{job['user_id']}'")
+            await set_rls_context(conn, job["user_id"])
             
             # Fetch drafted sections
             draft_row = await conn.fetchrow(
@@ -307,7 +308,7 @@ Return ONLY 'pass', 'unsupported', or 'contradicted' (lowercase, single word).""
     if verification_results:
         async with db_pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(f"SET LOCAL jwt.claims.sub = '{job['user_id']}'")
+                await set_rls_context(conn, job["user_id"])
                 for r in verification_results:
                     await conn.execute(
                         """
