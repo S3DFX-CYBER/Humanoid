@@ -19,9 +19,7 @@ async def lifespan(app: FastAPI):
     await get_pool()
 
     # Initialize Redis
-    app.state.redis = aioredis.from_url(
-        settings.redis_url, decode_responses=True
-    )
+    app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
 
     yield
 

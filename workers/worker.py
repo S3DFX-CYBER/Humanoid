@@ -10,13 +10,13 @@ Phase 0: Only proves the loop works with `queued → researching → done`.
 import asyncio
 import logging
 import uuid
-from datetime import timezone
 
 import asyncpg
 
 from arq.connections import RedisSettings
 
 from api.config import get_settings
+from providers import get_provider_pool
 from workers.stages import (
     run_research,
     run_outline,
@@ -119,9 +119,7 @@ async def _fail_stage(
         )
 
 
-async def _get_last_completed_stage(
-    pool: asyncpg.Pool, job_id: str
-) -> str | None:
+async def _get_last_completed_stage(pool: asyncpg.Pool, job_id: str) -> str | None:
     """Find the last completed stage name for resume support."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -174,20 +172,15 @@ async def run_pipeline(ctx: dict, job_id: str) -> str:
             stage_id = await _create_stage_record(pool, job_id, stage_name)
 
             try:
-                # Run the stage handler (in Phase 1, pass the provider default components)
+                # Run stage handler with provider and database components.
                 output = await stage_handler(
-                    job_id, 
-                    {
-                        "provider_pool": ctx["provider_pool"],
-                        "db_pool": pool
-                    }
+                    job_id,
+                    {"provider_pool": ctx["provider_pool"], "db_pool": pool},
                 )
 
                 # Persist output
                 await _complete_stage(pool, stage_id, output)
-                logger.info(
-                    "[worker] job=%s stage '%s' completed", job_id, stage_name
-                )
+                logger.info("[worker] job=%s stage '%s' completed", job_id, stage_name)
 
                 # Small delay between stages (simulates real work in Phase 0)
                 await asyncio.sleep(1)
@@ -213,8 +206,6 @@ async def run_pipeline(ctx: dict, job_id: str) -> str:
         await _update_job_status(pool, job_id, "failed")
         raise
 
-
-from providers import get_provider_pool
 
 async def startup(ctx: dict) -> None:
     """Worker startup hook — initialize shared resources."""

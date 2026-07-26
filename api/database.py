@@ -14,6 +14,7 @@ async def set_rls_context(conn: asyncpg.Connection, user_id: str) -> None:
     """
     await conn.execute("SELECT set_config($1, $2, true)", RLS_USER_CLAIM, str(user_id))
 
+
 _pool: asyncpg.Pool | None = None
 
 
@@ -38,7 +39,9 @@ async def close_pool() -> None:
         _pool = None
 
 
-async def fetch_one(query: str, *args, user_id: str | None = None) -> asyncpg.Record | None:
+async def fetch_one(
+    query: str, *args, user_id: str | None = None
+) -> asyncpg.Record | None:
     """Execute a query and return a single row, optionally setting RLS context."""
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -49,7 +52,9 @@ async def fetch_one(query: str, *args, user_id: str | None = None) -> asyncpg.Re
         return await conn.fetchrow(query, *args)
 
 
-async def fetch_all(query: str, *args, user_id: str | None = None) -> list[asyncpg.Record]:
+async def fetch_all(
+    query: str, *args, user_id: str | None = None
+) -> list[asyncpg.Record]:
     """Execute a query and return all rows, optionally setting RLS context."""
     pool = await get_pool()
     async with pool.acquire() as conn:

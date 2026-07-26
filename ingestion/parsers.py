@@ -29,19 +29,28 @@ async def extract_text(content: bytes, file_type: str) -> str:
 async def _parse_pdf(content: bytes) -> str:
     """Extract text from PDF using pymupdf. [STUB]"""
     logger.info("[parser:pdf] Stub — %d bytes received", len(content))
-    return f"[PDF STUB] Received {len(content)} bytes. Real extraction not implemented yet."
+    return (
+        f"[PDF STUB] Received {len(content)} bytes. "
+        "Real extraction not implemented yet."
+    )
 
 
 async def _parse_docx(content: bytes) -> str:
     """Extract text from DOCX using python-docx. [STUB]"""
     logger.info("[parser:docx] Stub — %d bytes received", len(content))
-    return f"[DOCX STUB] Received {len(content)} bytes. Real extraction not implemented yet."
+    return (
+        f"[DOCX STUB] Received {len(content)} bytes. "
+        "Real extraction not implemented yet."
+    )
 
 
 async def _parse_ppt(content: bytes) -> str:
     """Extract text from PPTX using python-pptx. [STUB]"""
     logger.info("[parser:ppt] Stub — %d bytes received", len(content))
-    return f"[PPT STUB] Received {len(content)} bytes. Real extraction not implemented yet."
+    return (
+        f"[PPT STUB] Received {len(content)} bytes. "
+        "Real extraction not implemented yet."
+    )
 
 
 async def _parse_image_ocr(content: bytes) -> str:

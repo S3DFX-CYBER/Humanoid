@@ -19,7 +19,8 @@ class StubProvider(Provider):
     async def complete(self, prompt: str, **kwargs) -> str:
         """Return a canned stub response."""
         logger.warning(
-            "[StubProvider] Serving stub response — no real fallback provider configured. "
+            "[StubProvider] Serving stub response — "
+            "no real fallback provider configured. "
             "Prompt length: %d chars",
             len(prompt),
         )

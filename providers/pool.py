@@ -91,9 +91,10 @@ class ProviderPool:
             providers = self._get_available_providers(tier)
 
             if not providers:
-                wait = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 1)
+                wait = BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 1)
                 logger.warning(
-                    "[ProviderPool] No providers available, waiting %.1fs (attempt %d/%d)",
+                    "[ProviderPool] No providers available, "
+                    "waiting %.1fs (attempt %d/%d)",
                     wait,
                     attempt + 1,
                     MAX_RETRIES,
@@ -124,7 +125,7 @@ class ProviderPool:
                         self._apply_cooldown(provider)
 
             # Exponential backoff + jitter between retry rounds
-            wait = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 1)
+            wait = BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 1)
             logger.info("[ProviderPool] Backing off %.1fs before retry", wait)
             await asyncio.sleep(wait)
 
