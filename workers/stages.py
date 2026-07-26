@@ -63,6 +63,9 @@ async def run_research(job_id: str, input_data: dict) -> dict:
         results = await get_search_results(q, max_results=2)
         for res in results:
             url = res.get("href")
+            if not isinstance(url, str) or not url:
+                continue
+
             title = res.get("title", "Untitled")
 
             # Fetch actual page content

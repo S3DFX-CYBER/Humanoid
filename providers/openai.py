@@ -14,7 +14,7 @@ class OpenAIProvider(Provider):
     def __init__(self, model_name: str = "gpt-4o-mini"):
         super().__init__("openai")
         self.model_name = model_name
-        self.client = None
+        self.client: AsyncOpenAI | None = None
         self._init_client()
 
     def _init_client(self) -> None:
