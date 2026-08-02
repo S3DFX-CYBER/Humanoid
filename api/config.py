@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379"
-    
+
     # Rate Limits & Quotas
     max_concurrent_jobs_per_user: int = 3
     max_daily_jobs_per_user: int = 20

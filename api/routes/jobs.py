@@ -14,6 +14,7 @@ router = APIRouter()
 
 # ── Request / Response Models ────────────────────────────────
 
+
 class JobCreate(BaseModel):
     topic: str
     citation_style: str = "apa"
@@ -45,6 +46,7 @@ class StageResponse(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────
 
+
 def _record_to_dict(record) -> dict:
     """Convert an asyncpg Record to a JSON-safe dict."""
     d = dict(record)
@@ -58,6 +60,7 @@ def _record_to_dict(record) -> dict:
 
 # ── Routes ───────────────────────────────────────────────────
 
+
 @router.post("", response_model=JobResponse, status_code=201)
 async def create_job(
     body: JobCreate,
@@ -69,26 +72,39 @@ async def create_job(
 
     # Rate limiting: Check concurrent active jobs
     active_jobs = await fetch_one(
-        "SELECT COUNT(*) as count FROM jobs WHERE user_id = $1 AND status NOT IN ('done', 'failed')",
+        """
+        SELECT COUNT(*) as count FROM jobs
+        WHERE user_id = $1 AND status NOT IN ('done', 'failed')
+        """,
         uuid.UUID(user_id),
         user_id=user_id,
     )
     if active_jobs and active_jobs["count"] >= settings.max_concurrent_jobs_per_user:
         raise HTTPException(
             status_code=429,
-            detail=f"Exceeded maximum concurrent jobs ({settings.max_concurrent_jobs_per_user}). Please wait for current jobs to finish.",
+            detail=(
+                "Exceeded maximum concurrent jobs "
+                f"({settings.max_concurrent_jobs_per_user}). "
+                "Please wait for current jobs to finish."
+            ),
         )
 
     # Rate limiting: Check daily quota
     daily_jobs = await fetch_one(
-        "SELECT COUNT(*) as count FROM jobs WHERE user_id = $1 AND created_at > now() - interval '1 day'",
+        """
+        SELECT COUNT(*) as count FROM jobs
+        WHERE user_id = $1
+          AND created_at > now() - interval '1 day'
+        """,
         uuid.UUID(user_id),
         user_id=user_id,
     )
     if daily_jobs and daily_jobs["count"] >= settings.max_daily_jobs_per_user:
         raise HTTPException(
             status_code=429,
-            detail=f"Exceeded daily job limit ({settings.max_daily_jobs_per_user}). Please try again tomorrow.",
+            detail="Exceeded daily job limit "
+            f"({settings.max_daily_jobs_per_user}). "
+            "Please try again tomorrow.",
         )
 
     job_id = uuid.uuid4()

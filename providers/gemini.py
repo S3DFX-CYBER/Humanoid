@@ -7,7 +7,12 @@ from providers.base import Provider, ProviderError, ProviderFatalError
 class GeminiProvider(Provider):
     """Calls Google Gemini Flash via the generativeai SDK."""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash", tier: str = "cheap"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gemini-2.0-flash",
+        tier: str = "cheap",
+    ):
         super().__init__(name="gemini-flash", tier=tier)
         self.api_key = api_key
         self.model_name = model
@@ -33,9 +38,13 @@ class GeminiProvider(Provider):
 
             # Classify as retryable or fatal
             if "429" in error_str or "Resource exhausted" in error_str:
-                raise ProviderError(f"Gemini rate limited: {error_str}", status_code=429)
+                raise ProviderError(
+                    f"Gemini rate limited: {error_str}", status_code=429
+                )
             elif "500" in error_str or "503" in error_str:
-                raise ProviderError(f"Gemini server error: {error_str}", status_code=500)
+                raise ProviderError(
+                    f"Gemini server error: {error_str}", status_code=500
+                )
             elif "403" in error_str or "401" in error_str:
                 raise ProviderFatalError(f"Gemini auth error: {error_str}")
             else:

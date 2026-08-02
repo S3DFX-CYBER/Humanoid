@@ -7,17 +7,36 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- DEV ENVIRONMENT MOCK FOR SUPABASE RLS
 -- ============================================================
 -- Supabase includes `auth.uid()`, pure Postgres does not.
--- This block safely creates the schema and function only if it's missing,
--- stubbing it to read our custom session variable `jwt.claims.sub`.
+-- This block safely creates or upgrades only local stub functions so they
+-- read Supabase's real session variable `request.jwt.claim.sub`.
 
 DO $$
+DECLARE
+    uid_source text;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_proc JOIN pg_namespace ON pg_proc.pronamespace = pg_namespace.oid 
-        WHERE pg_namespace.nspname = 'auth' AND pg_proc.proname = 'uid'
-    ) THEN
-        CREATE SCHEMA IF NOT EXISTS auth;
-        EXECUTE 'CREATE FUNCTION auth.uid() RETURNS uuid AS $func$ SELECT NULLIF(current_setting(''jwt.claims.sub'', true), '''')::uuid; $func$ LANGUAGE SQL STABLE;';
+    CREATE SCHEMA IF NOT EXISTS auth;
+
+    SELECT pg_proc.prosrc
+    INTO uid_source
+    FROM pg_proc
+    JOIN pg_namespace ON pg_proc.pronamespace = pg_namespace.oid
+    WHERE pg_namespace.nspname = 'auth'
+      AND pg_proc.proname = 'uid'
+    LIMIT 1;
+
+    IF uid_source IS NULL
+       OR (
+           uid_source LIKE '%jwt.claims.sub%'
+           AND uid_source NOT LIKE '%request.jwt.claim.sub%'
+       ) THEN
+        EXECUTE '
+            CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid AS $func$
+            SELECT NULLIF(
+                current_setting(''request.jwt.claim.sub'', true),
+                ''''
+            )::uuid;
+            $func$ LANGUAGE SQL STABLE;
+        ';
     END IF;
 END $$;
 

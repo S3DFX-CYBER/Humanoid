@@ -1,13 +1,14 @@
 """Abstract base class for LLM providers."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 
 @dataclass
 class ProviderStatus:
     """Tracks the health/cooldown state of a provider."""
+
     name: str
     is_available: bool = True
     consecutive_failures: int = 0
@@ -62,4 +63,5 @@ class ProviderError(Exception):
 
 class ProviderFatalError(Exception):
     """Non-retryable provider error (auth failure, bad request)."""
+
     pass
