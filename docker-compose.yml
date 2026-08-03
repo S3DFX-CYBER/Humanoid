@@ -59,6 +59,7 @@ services:
     environment:
       DATABASE_URL: postgresql://humanoid:humanoid@postgres:5432/humanoid
       REDIS_URL: redis://redis:6379
+      RENDER_SERVICE_URL: http://render:8002
       ENVIRONMENT: development
     depends_on:
       postgres:

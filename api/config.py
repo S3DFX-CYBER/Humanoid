@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # LLM Providers
     gemini_api_key: str = ""
 
+    # Internal services
+    render_service_url: str = "http://render:8002"
+
     # App
     api_host: str = "0.0.0.0"
     api_port: int = 8000
