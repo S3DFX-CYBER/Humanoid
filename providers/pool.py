@@ -1,135 +1,117 @@
-"""Provider pool with retry, backoff, cooldown, and tiered routing."""
+"""Provider routing with retries, fallback, and provider cooldowns."""
 
 import asyncio
 import logging
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from providers.base import Provider, ProviderError, ProviderFatalError
+from providers.base import Provider, ProviderError, ProviderFatalError, ProviderStatus
 
 logger = logging.getLogger(__name__)
 
-# Cooldown config
 BASE_COOLDOWN_SECONDS = 30
 MAX_COOLDOWN_SECONDS = 300
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
 
-class ProviderPool:
-    """Manages a pool of LLM providers with retry, backoff, and tiered routing.
+class ProviderExhaustedError(ProviderError):
+    """Raised when every eligible provider has exhausted its retries."""
 
-    Usage:
-        pool = ProviderPool(providers=[gemini, stub])
-        result = await pool.call("Write an essay about X", tier="premium")
+
+class ProviderPool:
+    """Route completions to tiered providers with reliable fallback behavior.
+
+    ``providers`` is optional to make it easy for applications to register
+    providers after configuration has loaded.  The public tier mapping also
+    keeps provider selection explicit and inspectable for health checks.
     """
 
-    def __init__(self, providers: list[Provider]):
-        if not providers:
-            raise ValueError("ProviderPool requires at least one provider")
-        self.providers = providers
+    def __init__(self, providers: list[Provider] | None = None):
+        self.providers: dict[str, list[Provider]] = {}
+        self.status: dict[str, ProviderStatus] = {}
+        for provider in providers or []:
+            self.add(provider)
 
-    def _get_available_providers(self, tier: str = "cheap") -> list[Provider]:
-        """Return providers that are available and match the requested tier.
+    def add(self, provider: Provider) -> None:
+        """Register a provider in its configured tier."""
+        self.providers.setdefault(provider.tier, []).append(provider)
+        self.status[provider.name] = provider.status
 
-        Falls back to any available provider if no tier match is found.
-        """
-        now = datetime.utcnow()
+    def _get_available_providers(self, tier: str) -> list[Provider]:
+        """Return available providers, preferring the requested tier."""
+        now = datetime.now(timezone.utc)
+        candidates = self.providers.get(tier, [])
+        if not candidates:
+            candidates = [
+                provider
+                for group in self.providers.values()
+                for provider in group
+            ]
+
         available = []
-
-        for p in self.providers:
-            # Skip providers in cooldown
-            if p.status.cooldown_until and now < p.status.cooldown_until:
+        for provider in candidates:
+            self.status[provider.name] = provider.status
+            cooldown_until = provider.status.cooldown_until
+            if cooldown_until and cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+                provider.status.cooldown_until = cooldown_until
+            if cooldown_until and now < cooldown_until:
                 continue
-            # Reset cooldown if expired
-            if p.status.cooldown_until and now >= p.status.cooldown_until:
-                p.status.cooldown_until = None
-                p.status.is_available = True
-            if p.status.is_available:
-                available.append(p)
-
-        # Prefer tier-matched providers
-        tier_matched = [p for p in available if p.tier == tier]
-        return tier_matched if tier_matched else available
+            if cooldown_until:
+                provider.status.cooldown_until = None
+                provider.status.is_available = True
+            if provider.status.is_available:
+                available.append(provider)
+        return available
 
     def _apply_cooldown(self, provider: Provider) -> None:
-        """Put a provider into cooldown after repeated failures."""
         failures = provider.status.consecutive_failures
-        cooldown_seconds = min(
-            BASE_COOLDOWN_SECONDS * (2 ** (failures - 1)),
-            MAX_COOLDOWN_SECONDS,
+        seconds = min(
+            BASE_COOLDOWN_SECONDS * (2 ** (failures - 1)), MAX_COOLDOWN_SECONDS
         )
-        provider.status.cooldown_until = datetime.utcnow() + timedelta(
-            seconds=cooldown_seconds
+        provider.status.cooldown_until = datetime.now(timezone.utc) + timedelta(
+            seconds=seconds
         )
         provider.status.is_available = False
-        logger.warning(
-            "[ProviderPool] %s in cooldown for %ds (failures: %d)",
-            provider.name,
-            cooldown_seconds,
-            failures,
-        )
+        logger.warning("[ProviderPool] %s in cooldown for %ds", provider.name, seconds)
 
-    async def call(self, prompt: str, tier: str = "cheap", **kwargs) -> str:
-        """Route a prompt through the provider pool with retry + backoff.
-
-        Args:
-            prompt: The prompt to send.
-            tier: "cheap" for structured/verification calls, "premium" for drafting.
-            **kwargs: Passed through to the provider's complete() method.
-
-        Returns:
-            The completion text.
-
-        Raises:
-            ProviderError: If all providers and retries are exhausted.
-            ProviderFatalError: If a non-retryable error occurs.
-        """
+    async def call(self, prompt: str, tier: str = "cheap", **kwargs: object) -> str:
+        """Complete a prompt, retrying each provider before trying its fallback."""
         last_error: Exception | None = None
+        providers = self._get_available_providers(tier)
+        if not providers:
+            raise ProviderExhaustedError("No providers are currently available")
 
-        for attempt in range(MAX_RETRIES):
-            providers = self._get_available_providers(tier)
-
-            if not providers:
-                wait = BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "[ProviderPool] No providers available, "
-                    "waiting %.1fs (attempt %d/%d)",
-                    wait,
-                    attempt + 1,
-                    MAX_RETRIES,
-                )
-                await asyncio.sleep(wait)
-                continue
-
-            for provider in providers:
+        for provider in providers:
+            for attempt in range(MAX_RETRIES):
+                previous_failures = provider.status.consecutive_failures
                 try:
                     result = await provider.complete(prompt, **kwargs)
+                    provider.mark_success()
                     return result
-
                 except ProviderFatalError:
-                    # Non-retryable — don't try other providers for auth issues
                     raise
-
-                except ProviderError as e:
-                    last_error = e
+                except Exception as error:  # providers may raise SDK-specific errors
+                    last_error = error
+                    if provider.status.consecutive_failures == previous_failures:
+                        provider.mark_failure()
+                    self.status[provider.name] = provider.status
                     logger.warning(
                         "[ProviderPool] %s failed (attempt %d/%d): %s",
                         provider.name,
                         attempt + 1,
                         MAX_RETRIES,
-                        str(e),
+                        error,
                     )
-                    # Apply cooldown if provider has 3+ consecutive failures
-                    if provider.status.consecutive_failures >= 3:
-                        self._apply_cooldown(provider)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(
+                            BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 1)
+                        )
 
-            # Exponential backoff + jitter between retry rounds
-            wait = BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 1)
-            logger.info("[ProviderPool] Backing off %.1fs before retry", wait)
-            await asyncio.sleep(wait)
+            self._apply_cooldown(provider)
 
-        raise ProviderError(
-            f"All providers exhausted after {MAX_RETRIES} attempts. "
-            f"Last error: {last_error}"
+        raise ProviderExhaustedError(
+            "All providers exhausted after "
+            f"{MAX_RETRIES} attempts. Last error: {last_error}"
         )

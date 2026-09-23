@@ -54,11 +54,17 @@ jobs:
         flake8 api workers providers ingestion render
         mypy api workers providers ingestion render --ignore-missing-imports
 
+    - name: Build frontend
+      run: |
+        npm ci --prefix frontend
+        npm run build --prefix frontend
+
     - name: Run tests (with coverage)
       env:
         DATABASE_URL: postgresql://humanoid:humanoid@localhost:5432/humanoid
         REDIS_URL: redis://localhost:6379
         ENVIRONMENT: test
+        PGPASSWORD: humanoid
       run: |
         # Setup schema
         psql -h localhost -U humanoid -d humanoid -f db/schema.sql

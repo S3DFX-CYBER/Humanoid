@@ -31,6 +31,14 @@ It is designed with a strictly minimal UI (black & white achromatic flat design)
 docker compose up
 ```
 
+## Vercel deployment
+
+The repository includes a root `vercel.json` so Vercel builds the Next.js app
+from `frontend/` instead of attempting to deploy the FastAPI service. Set
+`NEXT_PUBLIC_API_URL` in the Vercel project to the HTTPS URL of the separately
+deployed API before enabling job creation. The API, Redis worker, and Postgres
+database require a long-running deployment and are not Vercel functions.
+
 ## License
 
 MIT License
