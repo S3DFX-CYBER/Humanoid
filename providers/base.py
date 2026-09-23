@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -50,7 +50,7 @@ class Provider(ABC):
     def mark_failure(self) -> None:
         """Record a failure and potentially trigger cooldown."""
         self.status.consecutive_failures += 1
-        self.status.last_failure_time = datetime.utcnow()
+        self.status.last_failure_time = datetime.now(timezone.utc)
 
 
 class ProviderError(Exception):
