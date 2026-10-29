@@ -20,6 +20,16 @@ text.
 | Providers | Gemini (`google-genai`) for drafting, OpenAI for cheap passes, with cooldown + fallback |
 | Isolated services | `ingestion` (PDF/DOCX/PPTX/OCR, port 8001), `render` (DOCX/PDF, port 8002) |
 
+## Documentation
+
+| Document | Covers |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | services, request flow, the six stages, why the worker and the isolated containers exist |
+| [docs/database.md](docs/database.md) | tables, the two database roles, how RLS scoping works, migrations |
+| [docs/development.md](docs/development.md) | setup, environment variables, tests, troubleshooting |
+| [docs/security.md](docs/security.md) | the two auth layers, the dev bypass, SSRF and upload hardening, what is *not* protected |
+| [BUG_REPORT.md](BUG_REPORT.md) | the audit behind this code: every issue, its cause, its fix, and what still needs a decision |
+
 ## Quick start
 
 ```bash
