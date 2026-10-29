@@ -75,11 +75,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No dependency cache on purpose: the lockfile is not committed until a
+      # later change, and `cache: npm` fails hard when its path is missing.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Install
         run: npm install --no-audit --no-fund
