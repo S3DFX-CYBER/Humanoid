@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ── Data Stores ──────────────────────────────────────────────
 
@@ -13,20 +11,21 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      # Only runs on an empty volume: `docker compose down -v` to re-init.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U humanoid" ]
+      test: ["CMD-SHELL", "pg_isready -U humanoid -d humanoid"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -40,9 +39,21 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # The application role is a non-owner, so RLS applies to it.
       DATABASE_URL: postgresql://humanoid_app:humanoid_app@postgres:5432/humanoid
       REDIS_URL: redis://redis:6379
-      ENVIRONMENT: development
+      RENDER_SERVICE_URL: http://render:8002
+      INGESTION_SERVICE_URL: http://ingestion:8001
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      SUPABASE_URL: ${SUPABASE_URL:-http://localhost:54321}
+      SUPABASE_KEY: ${SUPABASE_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
+      # Local development only — remove for any shared deployment.
+      DEV_AUTH_USER_ID: ${DEV_AUTH_USER_ID:-a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ALLOW_STUB_PROVIDER: ${ALLOW_STUB_PROVIDER:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,15 +71,33 @@ services:
       DATABASE_URL: postgresql://humanoid_app:humanoid_app@postgres:5432/humanoid
       REDIS_URL: redis://redis:6379
       RENDER_SERVICE_URL: http://render:8002
-      ENVIRONMENT: development
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ALLOW_STUB_PROVIDER: ${ALLOW_STUB_PROVIDER:-false}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      render:
+        condition: service_healthy
     volumes:
       - .:/app
     command: arq workers.worker.WorkerSettings
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_KEY:-}
+    depends_on:
+      - api
 
   # ── Isolated Services ───────────────────────────────────────
 
@@ -78,12 +107,16 @@ services:
       dockerfile: ingestion/Dockerfile
     ports:
       - "8001:8001"
-    # No DB or Redis access — isolated by design
+    # No DB or Redis access — isolated by design.
     healthcheck:
-      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')" ]
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
   render:
     build:
@@ -91,12 +124,16 @@ services:
       dockerfile: render/Dockerfile
     ports:
       - "8002:8002"
-    # No DB or Redis access — isolated by design
+    # No DB or Redis access — isolated by design.
     healthcheck:
-      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')" ]
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
 volumes:
   pgdata:

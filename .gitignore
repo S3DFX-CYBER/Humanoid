@@ -36,6 +36,7 @@ frontend/out/
 docker-compose.override.yml
 
 # Test
+*.tsbuildinfo
 .pytest_cache/
 .coverage
 htmlcov/

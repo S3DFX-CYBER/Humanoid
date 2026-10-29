@@ -1,13 +1,11 @@
 """Pipeline stage handlers.
 
-Research, outline, draft, verify, style, and format jobs by reading and
-writing stage outputs.  The core research/draft/verify stages perform
-real provider-backed work.  Style applies LLM-driven clarity rules
-(PRD 6.3a).  Format compiles Markdown and delegates to the render
-micro-service for DOCX/PDF.
-
 Stage order:
-  researching → outlining → drafting → verifying → styling → formatting
+  research -> outline -> draft -> verify -> style -> format
+
+Each handler receives ``(job_id, ctx)`` where ``ctx`` carries the provider
+pool, the database pool, and the job owner's ``user_id``.  Every database
+access goes through ``user_connection`` so Row-Level Security applies.
 """
 
 import json
@@ -18,655 +16,646 @@ import uuid
 import httpx
 
 from api.config import get_settings
-from api.database import set_rls_context
+from api.database import user_connection
 from providers.embedding import generate_embedding
-from providers.search import get_search_results, fetch_and_extract_text
+from providers.search import fetch_and_extract_text, get_search_results
+from workers.citations import build_verification_section, number_citations
 
 logger = logging.getLogger(__name__)
 
+MAX_SOURCES = 6
+MIN_SOURCE_CHARS = 200
 
-# ── Stage 1: Research ──────────────────────────────────────────
+
+# ── Shared helpers ─────────────────────────────────────────────
 
 
-async def run_research(job_id: str, input_data: dict) -> dict:
-    """Research sources for the given topic."""
-    logger.info("[stage:research] job=%s — beginning real search", job_id)
+async def _load_job(conn, job_id: str) -> dict:
+    row = await conn.fetchrow(
+        "SELECT id, topic, user_id, citation_style FROM jobs WHERE id = $1",
+        uuid.UUID(job_id),
+    )
+    if row is None:
+        raise ValueError(f"Job {job_id} not found")
+    return dict(row)
 
-    provider_pool = input_data["provider_pool"]
-    db_pool = input_data["db_pool"]
 
-    # 1. Fetch job topic & user_id
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id)
-        )
-        if not job:
-            raise ValueError(f"Job {job_id} not found")
-        topic = job["topic"]
-        user_id = job["user_id"]
+async def _stage_output(conn, job_id: str, stage_name: str) -> dict | None:
+    """Read the most recent completed output for a stage."""
+    row = await conn.fetchrow(
+        """
+        SELECT output_data FROM job_stages
+        WHERE job_id = $1 AND stage_name = $2 AND status = 'completed'
+        ORDER BY completed_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        uuid.UUID(job_id),
+        stage_name,
+    )
+    if row is None:
+        return None
+    data = row["output_data"]
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return None
+    return data
 
-    # 2. Generate search queries via LLM
-    search_prompt = (
-        f"You are an expert researcher. The user's topic is: '{topic}'.\n"
-        "Generate 2 highly specific, distinct web search queries to find "
-        "the most credible, authoritative information about this topic.\n"
-        'Output ONLY a JSON array of strings. Example: ["query 1", "query 2"]'
+
+def _parse_json_response(text: str) -> dict:
+    """Parse a JSON response, tolerating stray code fences."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Models sometimes wrap JSON in prose — grab the outermost object.
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+# ── Stage 1: Research ─────────────────────────────────────────
+
+
+async def run_research(job_id: str, ctx: dict) -> dict:
+    """Find sources for the topic and store them with embeddings."""
+    provider_pool = ctx["provider_pool"]
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
+
+    async with user_connection(db_pool, user_id) as conn:
+        job = await _load_job(conn, job_id)
+
+    topic = job["topic"]
+    logger.info("[stage:research] job=%s topic=%r", job_id, topic)
+
+    query_prompt = (
+        "You are an expert research librarian.\n"
+        f"Topic: {topic}\n"
+        "Write 3 specific, complementary web search queries that would find "
+        "authoritative sources (peer-reviewed work, primary data, official "
+        "documentation) for this topic.\n"
+        'Respond as JSON: {"queries": ["query 1", "query 2", "query 3"]}'
     )
 
     try:
-        queries_json = await provider_pool.call(search_prompt, tier="cheap")
-        queries_json = queries_json.replace("```json", "").replace("```", "").strip()
-        queries = json.loads(queries_json)
-        if not isinstance(queries, list):
-            queries = [topic]
-    except Exception as e:
-        logger.error("[stage:research] Failed to generate queries: %s", e)
+        queries = _parse_json_response(
+            await provider_pool.call_json(query_prompt, tier="cheap")
+        ).get("queries") or []
+    except Exception as exc:
+        logger.warning("[stage:research] query generation failed: %s", exc)
+        queries = []
+
+    queries = [q for q in queries if isinstance(q, str) and q.strip()][:3]
+    if not queries:
         queries = [topic]
 
-    queries = queries[:2]
+    seen_urls: set[str] = set()
+    saved = 0
+    skipped = 0
 
-    # 3. Execute searches & fetch content
-    sources_saved = 0
-    for q in queries:
-        results = await get_search_results(q, max_results=2)
-        for res in results:
-            url = res.get("href")
-            if not isinstance(url, str) or not url:
+    for query in queries:
+        if saved >= MAX_SOURCES:
+            break
+        results = await get_search_results(query, max_results=4)
+
+        for result in results:
+            if saved >= MAX_SOURCES:
+                break
+
+            url = result["href"]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            content = await fetch_and_extract_text(url, max_chars=6000)
+            if len(content) < MIN_SOURCE_CHARS:
+                content = result.get("body", "")
+            if len(content) < MIN_SOURCE_CHARS:
+                skipped += 1
                 continue
 
-            title = res.get("title", "Untitled")
-
-            content = await fetch_and_extract_text(url, max_chars=4000)
-            if not content:
-                content = res.get("body", "")
-
-            if len(content) < 50:
-                continue
-
-            # 4. Generate embedding
             vector = await generate_embedding(content)
 
-            # 5. Store with RLS context
-            async with db_pool.acquire() as conn:
-                async with conn.transaction():
-                    await set_rls_context(conn, user_id)
-                    await conn.execute(
-                        """
-                        INSERT INTO sources (
-                            job_id, url, title, content_text,
-                            source_type, embedding
-                        )
-                        VALUES ($1, $2, $3, $4, 'web', $5::vector)
-                        """,
-                        uuid.UUID(job_id),
-                        url,
-                        title,
-                        content,
-                        vector,
-                    )
-            sources_saved += 1
+            async with user_connection(db_pool, user_id) as conn:
+                inserted = await conn.fetchval(
+                    """
+                    INSERT INTO sources (job_id, url, title, content_text,
+                                         source_type, embedding)
+                    VALUES ($1, $2, $3, $4, 'web', $5::vector)
+                    ON CONFLICT (job_id, url) DO NOTHING
+                    RETURNING id
+                    """,
+                    uuid.UUID(job_id),
+                    url,
+                    result["title"][:500],
+                    content,
+                    vector,
+                )
+            if inserted:
+                saved += 1
+
+    if saved == 0:
+        raise ValueError(
+            "No usable sources were found for this topic. Try a more specific "
+            "topic, or check that the search provider is reachable."
+        )
 
     return {
         "queries_used": queries,
-        "sources_found": sources_saved,
-        "note": f"Completed research for topic: {topic}",
+        "sources_found": saved,
+        "sources_skipped": skipped,
+        "note": f"Collected {saved} sources for {topic!r}",
     }
 
 
 # ── Stage 2: Outline ──────────────────────────────────────────
 
 
-async def run_outline(job_id: str, input_data: dict) -> dict:
-    """Generate thesis + outline using sources from Stage 1."""
-    logger.info("[stage:outline] job=%s — generating outline", job_id)
+async def run_outline(job_id: str, ctx: dict) -> dict:
+    """Generate a title, thesis, and section outline from the sources."""
+    provider_pool = ctx["provider_pool"]
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
 
-    provider_pool = input_data["provider_pool"]
-    db_pool = input_data["db_pool"]
-
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id)
+    async with user_connection(db_pool, user_id) as conn:
+        job = await _load_job(conn, job_id)
+        sources = await conn.fetch(
+            """
+            SELECT title, content_text FROM sources
+            WHERE job_id = $1
+            ORDER BY created_at ASC
+            LIMIT 6
+            """,
+            uuid.UUID(job_id),
         )
 
-        async with conn.transaction():
-            await set_rls_context(conn, job["user_id"])
-            sources = await conn.fetch(
-                "SELECT title, content_text FROM sources WHERE job_id = $1 LIMIT 5",
-                uuid.UUID(job_id),
-            )
+    context = ""
+    for index, source in enumerate(sources, 1):
+        context += (
+            f"Source {index}: {source['title']}\n"
+            f"{(source['content_text'] or '')[:1800]}\n\n"
+        )
 
-    topic = job["topic"]
+    prompt = f"""You are an academic editor planning a research document.
 
-    source_context = ""
-    for i, s in enumerate(sources):
-        text = s["content_text"][:2000]
-        source_context += f"Source {i+1}: {s['title']}\n{text}\n\n"
+Topic: {job['topic']}
 
-    prompt = f"""You are an expert researcher writing an academic outline.
-Topic: {topic}.
-Review the following excerpts from our research phase:
+Source excerpts:
+{context}
 
-{source_context}
-
-Based off these sources, write a comprehensive outline for an authoritative
-article. Return your response STRICTLY as a JSON object with the following
-schema, and no markdown formatting or backticks:
+Produce an outline. Respond with JSON only, in exactly this shape:
 {{
-  "title": "Proposed Article Title",
-  "thesis": "A 1-2 sentence thesis statement",
+  "title": "A specific, informative document title",
+  "thesis": "One or two sentences stating the document's argument",
   "sections": [
-     "Introduction: [Hook and background]",
-     "Section 1: [Main point]",
-     ...,
-     "Conclusion: [Summary]"
+    "Introduction: <what this section establishes>",
+    "Section: <main point>",
+    "Conclusion: <what this section closes>"
   ]
 }}
-"""
+Use 4 to 6 sections. Every section must be supportable from the excerpts."""
+
     try:
-        response_text = await provider_pool.call(prompt, tier="premium")
-        response_text = response_text.replace("```json", "").replace("```", "").strip()
-        outline_json = json.loads(response_text)
-    except Exception as e:
-        logger.error("[stage:outline] Failed to parse generated outline: %s", e)
-        outline_json = {
-            "title": f"Report on {topic}",
-            "thesis": topic,
-            "sections": ["Introduction", "Main Body", "Conclusion"],
-        }
-
-    return outline_json
-
-
-# ── Stage 3: Draft ─────────────────────────────────────────────
-
-
-async def run_draft(job_id: str, input_data: dict) -> dict:
-    """Draft section-by-section with source-tagged claims.
-
-    If a section fails to draft, it is flagged with ``status: failed``
-    instead of silently inserting placeholder text.  Downstream stages
-    skip failed sections.
-    """
-    logger.info("[stage:draft] job=%s — drafting content", job_id)
-
-    provider_pool = input_data["provider_pool"]
-    db_pool = input_data["db_pool"]
-
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id)
+        outline = _parse_json_response(
+            await provider_pool.call_json(prompt, tier="premium")
         )
+    except Exception as exc:
+        logger.error("[stage:outline] generation failed: %s", exc)
+        raise ValueError(f"Could not generate an outline: {exc}") from exc
 
-        async with conn.transaction():
-            await set_rls_context(conn, job["user_id"])
+    sections = outline.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError("Outline contained no sections")
 
-            # 1. Fetch outline from previous stage — require approval
-            outline_row = await conn.fetchrow(
-                """
-                SELECT output_data FROM job_stages
-                WHERE job_id = $1
-                  AND stage_name = 'outlining'
-                  AND status = 'completed'
-                ORDER BY completed_at DESC
-                LIMIT 1
-                """,
-                uuid.UUID(job_id),
-            )
-            outline_data = outline_row["output_data"] if outline_row else None
-            if isinstance(outline_data, str):
-                outline_data = json.loads(outline_data)
-
-            # 2. Fetch all sources for RAG context
-            sources = await conn.fetch(
-                "SELECT id, title, content_text FROM sources WHERE job_id = $1",
-                uuid.UUID(job_id),
-            )
-
-    if not outline_data or "sections" not in outline_data:
-        raise ValueError("Missing outline data to begin drafting")
-
-    topic = job["topic"]
-    thesis = outline_data.get("thesis", topic)
-
-    # 3. Build source context with IDs for citation tags
-    source_context = ""
-    for s in sources:
-        text = s["content_text"][:1000]
-        source_context += f"Source ID: {s['id']}\nTitle: {s['title']}\n{text}\n\n"
-
-    drafted_sections = []
-    failed_sections = []
-
-    # 4. Draft section by section
-    for section_outline in outline_data["sections"]:
-        prompt = f"""You are an advanced academic writer.
-Write the following section for an article.
-Topic: {topic}
-Overall Thesis: {thesis}
-
-Target Section Objective: {section_outline}
-
-Available Research Context:
-{source_context}
-
-INSTRUCTIONS:
-1. Write 2-3 comprehensive paragraphs based MUST ONLY on the provided
-   sources.
-2. Whenever you make a factual claim, append a citation tag using the EXACT
-   format: [cite: <SOURCE_ID>]. Do not invent facts; only use the Context.
-3. Write ONLY the text for the section; do not include the section header.
-"""
-        try:
-            content = await provider_pool.call(prompt, tier="premium")
-            drafted_sections.append(
-                {
-                    "header": section_outline,
-                    "content": content.strip(),
-                    "status": "ok",
-                }
-            )
-        except Exception as e:
-            logger.error(
-                "[stage:draft] Failed drafting section %r: %s",
-                section_outline,
-                e,
-            )
-            drafted_sections.append(
-                {
-                    "header": section_outline,
-                    "content": "",
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-            failed_sections.append(section_outline)
-
-    result: dict = {
-        "sections": drafted_sections,
-        "note": f"Drafted {len(drafted_sections)} sections",
+    return {
+        "title": outline.get("title") or job["topic"],
+        "thesis": outline.get("thesis") or "",
+        "sections": [str(s) for s in sections][:8],
+        "sources_used": len(sources),
     }
 
-    if failed_sections:
-        result["partial_failure"] = True
-        result["failed_sections"] = failed_sections
 
+# ── Stage 3: Draft ────────────────────────────────────────────
+
+
+async def run_draft(job_id: str, ctx: dict) -> dict:
+    """Draft each outline section against the retrieved sources."""
+    provider_pool = ctx["provider_pool"]
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
+
+    async with user_connection(db_pool, user_id) as conn:
+        job = await _load_job(conn, job_id)
+        outline = await _stage_output(conn, job_id, "outline")
+        sources = await conn.fetch(
+            """
+            SELECT id, title, url, content_text FROM sources
+            WHERE job_id = $1
+            ORDER BY created_at ASC
+            """,
+            uuid.UUID(job_id),
+        )
+
+    if not outline or not outline.get("sections"):
+        raise ValueError("Missing outline data to begin drafting")
+
+    context = ""
+    for source in sources:
+        context += (
+            f"SOURCE_ID: {source['id']}\n"
+            f"TITLE: {source['title']}\n"
+            f"URL: {source['url']}\n"
+            f"{(source['content_text'] or '')[:2500]}\n\n"
+        )
+
+    thesis = outline.get("thesis") or job["topic"]
+    drafted: list[dict] = []
+    failed: list[str] = []
+
+    for section in outline["sections"]:
+        prompt = f"""You are drafting one section of an academic document.
+
+Document title: {outline.get('title', job['topic'])}
+Overall thesis: {thesis}
+This section's objective: {section}
+
+Research context (the only information you may use):
+{context}
+
+Rules:
+1. Write 2-3 paragraphs of clear academic prose.
+2. Support every factual claim with a citation tag in the exact form
+   [cite: SOURCE_ID] using the SOURCE_ID values above. Never invent a
+   SOURCE_ID.
+3. If the context does not support a point, omit the point. Do not guess.
+4. Output the section body only — no heading, no commentary."""
+
+        try:
+            content = (await provider_pool.call(prompt, tier="premium")).strip()
+        except Exception as exc:
+            logger.error("[stage:draft] section %r failed: %s", section, exc)
+            drafted.append(
+                {
+                    "header": section,
+                    "content": "",
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+            failed.append(section)
+            continue
+
+        drafted.append({"header": section, "content": content, "status": "ok"})
+
+    if not any(s["status"] == "ok" for s in drafted):
+        raise ValueError("Every section failed to draft — no content produced")
+
+    result: dict = {
+        "sections": drafted,
+        "note": f"Drafted {len(drafted) - len(failed)}/{len(drafted)} sections",
+    }
+    if failed:
+        result["partial_failure"] = True
+        result["failed_sections"] = failed
     return result
 
 
-# ── Stage 4: Verify ────────────────────────────────────────────
+# ── Stage 4: Verify ───────────────────────────────────────────
 
-# Regex to find [cite: UUID] tags
-_CITE_PATTERN = re.compile(r"\[cite:\s*([a-f0-9\-]+)\]")
+CITE_PATTERN = re.compile(r"\[cite:\s*([0-9a-fA-F-]{36})\s*\]")
 
 
-def _extract_claims(content: str) -> list[tuple[str, list[str]]]:
-    """Split content into (claim_text, [source_ids]) tuples.
+def _extract_claims(content: str) -> list[tuple[str, str]]:
+    """Split content into (claim_text, source_id) pairs.
 
-    Instead of naively splitting on '.' (which breaks on abbreviations,
-    decimals, etc.), we split on citation-tag boundaries.  Each chunk of
-    text ending with one or more ``[cite: UUID]`` tags is treated as a
-    single claim.
+    A claim is the run of text preceding a citation tag. Splitting on tag
+    boundaries avoids the abbreviation and decimal-point breakage of a
+    naive sentence split.
     """
-    claims: list[tuple[str, list[str]]] = []
+    claims: list[tuple[str, str]] = []
+    last_end = 0
+    pending = ""
 
-    # Split around citation tags, keeping the tags as separate tokens
-    parts = _CITE_PATTERN.split(content)
-
-    # parts alternates: [text, uuid, text, uuid, ...]
-    # Walk through collecting text + the UUID(s) that follow it.
-    current_text = ""
-    current_ids: list[str] = []
-
-    for i, part in enumerate(parts):
-        if i % 2 == 0:
-            # This is a text segment
-            if current_ids:
-                # We already collected IDs for the previous text — flush
-                claims.append((current_text.strip(), current_ids))
-                current_text = ""
-                current_ids = []
-            current_text += part
-        else:
-            # This is a captured UUID from the citation tag
-            current_ids.append(part)
-
-    # Flush any remaining text+ids
-    if current_ids and current_text.strip():
-        claims.append((current_text.strip(), current_ids))
+    for match in CITE_PATTERN.finditer(content):
+        pending += content[last_end : match.start()]
+        claim_text = pending.strip()
+        if claim_text:
+            claims.append((claim_text, match.group(1).lower()))
+        pending = ""
+        last_end = match.end()
 
     return claims
 
 
-async def run_verify(job_id: str, input_data: dict) -> dict:
-    """Verify each claim against its cited source."""
-    logger.info("[stage:verify] job=%s — beginning verification", job_id)
+async def run_verify(job_id: str, ctx: dict) -> dict:
+    """Check every cited claim against the source it cites."""
+    provider_pool = ctx["provider_pool"]
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
 
-    provider_pool = input_data["provider_pool"]
-    db_pool = input_data["db_pool"]
-
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT topic, user_id FROM jobs WHERE id = $1", uuid.UUID(job_id)
-        )
-
-        async with conn.transaction():
-            await set_rls_context(conn, job["user_id"])
-
-            draft_row = await conn.fetchrow(
-                """
-                SELECT output_data FROM job_stages
-                WHERE job_id = $1
-                  AND stage_name = 'drafting'
-                  AND status = 'completed'
-                ORDER BY completed_at DESC
-                LIMIT 1
-                """,
-                uuid.UUID(job_id),
-            )
-            draft_data = draft_row["output_data"] if draft_row else None
-            if isinstance(draft_data, str):
-                draft_data = json.loads(draft_data)
-
-            sources_records = await conn.fetch(
-                "SELECT id, title, content_text FROM sources WHERE job_id = $1",
-                uuid.UUID(job_id),
-            )
-
-    if not draft_data or "sections" not in draft_data:
-        raise ValueError("Missing drafted sections data to verify")
-
-    source_map = {str(s["id"]): s for s in sources_records}
-
-    verified_claims = 0
-    verification_results = []
-
-    for section in draft_data["sections"]:
-        # Skip sections that failed during drafting
-        if section.get("status") == "failed":
-            continue
-
-        content = section.get("content", "")
-        claims = _extract_claims(content)
-
-        for claim_text, source_ids in claims:
-            for source_id in source_ids:
-                if source_id not in source_map:
-                    continue  # orphaned citation
-
-                source_text = source_map[source_id]["content_text"][:2000]
-
-                verify_prompt = f"""You are a fact checker.
-Verify the following claim against the provided source.
-Claim: "{claim_text}"
-Source Text: "{source_text}"
-
-Does the source support the claim?
-Return ONLY 'pass', 'unsupported', or 'contradicted'."""
-
-                try:
-                    verdict = (
-                        (await provider_pool.call(verify_prompt, tier="cheap"))
-                        .strip()
-                        .lower()
-                    )
-                    if verdict not in ("pass", "unsupported", "contradicted"):
-                        verdict = "unsupported"
-
-                    verification_results.append(
-                        {
-                            "job_id": job_id,
-                            "source_id": source_id,
-                            "claim_text": claim_text,
-                            "verdict": verdict,
-                        }
-                    )
-                    verified_claims += 1
-                except Exception as e:
-                    logger.warning("[stage:verify] Verification call failed: %s", e)
-
-    # Bulk insert verification results
-    if verification_results:
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                await set_rls_context(conn, job["user_id"])
-                for r in verification_results:
-                    await conn.execute(
-                        """
-                        INSERT INTO verification_results (
-                            job_id, source_id, claim_text, verdict
-                        )
-                        VALUES ($1, $2, $3, $4)
-                        """,
-                        uuid.UUID(r["job_id"]),
-                        uuid.UUID(r["source_id"]),
-                        r["claim_text"],
-                        r["verdict"],
-                    )
-
-    return {
-        "verified_claims_count": verified_claims,
-        "results": verification_results,
-        "note": f"Verified {verified_claims} claims",
-    }
-
-
-# ── Stage 5: Style ─────────────────────────────────────────────
-
-_STYLE_PROMPT_TEMPLATE = """You are an expert academic editor.
-Rewrite the following section to improve clarity and academic tone.
-
-RULES (PRD 6.3a):
-1. Cut filler words and phrases ("it is important to note that", "basically",
-   "in order to", "the fact that", "it should be noted").
-2. Fix vague attributions — replace "studies show", "experts say",
-   "research suggests" with either a concrete reference or remove the claim.
-3. Reduce inflated phrasing — prefer shorter, direct alternatives.
-4. Tighten passive voice where an active form is clearer.
-5. PRESERVE all [cite: <ID>] tags exactly as they appear — do not remove,
-   reorder, or modify any citation tags.
-6. Do NOT add new claims or information.  Only rephrase existing text.
-
-SECTION HEADER: {header}
-ORIGINAL TEXT:
-{content}
-
-Return ONLY the rewritten section text (no header, no commentary)."""
-
-
-async def run_style(job_id: str, input_data: dict) -> dict:
-    """Style & clarity pass using LLM (PRD 6.3a rules)."""
-    logger.info("[stage:style] job=%s — styling pass", job_id)
-
-    provider_pool = input_data["provider_pool"]
-    db_pool = input_data["db_pool"]
-
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT user_id FROM jobs WHERE id = $1", uuid.UUID(job_id)
-        )
-
-        async with conn.transaction():
-            await set_rls_context(conn, job["user_id"])
-            draft_row = await conn.fetchrow(
-                """
-                SELECT output_data FROM job_stages
-                WHERE job_id = $1
-                  AND stage_name = 'drafting'
-                  AND status = 'completed'
-                ORDER BY completed_at DESC
-                LIMIT 1
-                """,
-                uuid.UUID(job_id),
-            )
-
-    draft_data = draft_row["output_data"] if draft_row else None
-    if isinstance(draft_data, str):
-        draft_data = json.loads(draft_data)
-
-    if not draft_data or "sections" not in draft_data:
-        raise ValueError("Missing drafted sections data to style")
-
-    cleaned_sections = []
-    edits_made = 0
-
-    for section in draft_data["sections"]:
-        # Pass through failed sections untouched
-        if section.get("status") == "failed":
-            cleaned_sections.append(section)
-            continue
-
-        header = section.get("header", "")
-        content = section.get("content", "")
-
-        if not content.strip():
-            cleaned_sections.append(section)
-            continue
-
-        prompt = _STYLE_PROMPT_TEMPLATE.format(header=header, content=content)
-
-        try:
-            styled = await provider_pool.call(prompt, tier="cheap")
-            styled = styled.strip()
-            if styled:
-                edits_made += 1
-                cleaned_sections.append(
-                    {
-                        "header": header,
-                        "content": styled,
-                        "status": section.get("status", "ok"),
-                    }
-                )
-            else:
-                # LLM returned empty — keep original
-                cleaned_sections.append(section)
-        except Exception as e:
-            logger.warning(
-                "[stage:style] Style rewrite failed for %r, keeping original: %s",
-                header,
-                e,
-            )
-            cleaned_sections.append(section)
-
-    return {
-        "sections": cleaned_sections,
-        "edits_made": edits_made,
-        "note": f"Styled {edits_made} sections",
-    }
-
-
-# ── Stage 6: Format ────────────────────────────────────────────
-
-
-async def run_format(job_id: str, input_data: dict) -> dict:
-    """Format into submission-ready document.
-
-    Compiles Markdown from styled sections, then calls the render
-    micro-service to produce DOCX (and optionally PDF).  Falls back
-    to markdown-only if the render service is unavailable.
-    """
-    logger.info("[stage:format] job=%s — formatting final document", job_id)
-
-    db_pool = input_data["db_pool"]
-
-    async with db_pool.acquire() as conn:
-        job = await conn.fetchrow(
-            "SELECT topic, user_id, citation_style FROM jobs WHERE id = $1",
+    async with user_connection(db_pool, user_id) as conn:
+        draft = await _stage_output(conn, job_id, "draft")
+        sources = await conn.fetch(
+            "SELECT id, title, content_text FROM sources WHERE job_id = $1",
             uuid.UUID(job_id),
         )
 
-        async with conn.transaction():
-            await set_rls_context(conn, job["user_id"])
+    if not draft or not draft.get("sections"):
+        raise ValueError("Missing drafted sections to verify")
 
-            style_row = await conn.fetchrow(
-                """
-                SELECT output_data FROM job_stages
-                WHERE job_id = $1
-                  AND stage_name = 'styling'
-                  AND status = 'completed'
-                ORDER BY completed_at DESC
-                LIMIT 1
-                """,
-                uuid.UUID(job_id),
-            )
+    source_map = {str(row["id"]).lower(): row for row in sources}
+    results: list[dict] = []
+    orphaned = 0
 
-            # Gather source references for the bibliography
-            sources = await conn.fetch(
-                "SELECT id, title, url FROM sources WHERE job_id = $1",
-                uuid.UUID(job_id),
-            )
-
-    style_data = style_row["output_data"] if style_row else None
-    if isinstance(style_data, str):
-        style_data = json.loads(style_data)
-
-    if not style_data or "sections" not in style_data:
-        raise ValueError("Missing styled sections data to format")
-
-    topic = job["topic"]
-    citation_style = job.get("citation_style", "apa") or "apa"
-
-    # --- Compile Markdown ---
-    markdown_doc = f"# {topic.title()}\n\n"
-
-    for section in style_data["sections"]:
+    for section in draft["sections"]:
         if section.get("status") == "failed":
             continue
-        markdown_doc += f"## {section['header']}\n\n"
-        markdown_doc += f"{section['content']}\n\n"
 
-    logger.info(
-        "[stage:format] Markdown document compiled (%d bytes)", len(markdown_doc)
-    )
+        for claim_text, source_id in _extract_claims(section.get("content") or ""):
+            source = source_map.get(source_id)
+            if source is None:
+                orphaned += 1
+                continue
 
-    # --- Build render request payload ---
-    render_sections = [
-        {"header": s["header"], "body": s.get("content", "")}
-        for s in style_data["sections"]
-        if s.get("status") != "failed"
-    ]
-    references = [
-        {"id": str(s["id"]), "title": s["title"], "url": s["url"]}
-        for s in sources
-    ]
-
-    render_payload = {
-        "job_id": job_id,
-        "title": topic.title(),
-        "sections": render_sections,
-        "citation_style": citation_style,
-        "references": references,
-    }
-
-    # --- Call render micro-service ---
-    settings = get_settings()
-    render_url = getattr(settings, "render_service_url", "http://render:8002")
-    document_url = None
-    render_status = "skipped"
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(f"{render_url}/render/docx", json=render_payload)
-            resp.raise_for_status()
-            render_result = resp.json()
-            document_url = render_result.get("document_url")
-            render_status = render_result.get("status", "ok")
-            logger.info(
-                "[stage:format] Render service returned status=%s url=%s",
-                render_status,
-                document_url,
+            prompt = (
+                "You are a strict fact checker. Decide whether the source "
+                "supports the claim.\n\n"
+                f'CLAIM: "{claim_text[:1500]}"\n\n'
+                f'SOURCE ({source["title"]}):\n'
+                f'{(source["content_text"] or "")[:3000]}\n\n'
+                "Answer with exactly one word: pass, unsupported, or "
+                "contradicted."
             )
-    except Exception as e:
-        logger.warning(
-            "[stage:format] Render service unavailable, falling back to "
-            "markdown-only: %s",
-            e,
-        )
-        render_status = "fallback_markdown"
+
+            try:
+                verdict = (
+                    (await provider_pool.call(prompt, tier="cheap"))
+                    .strip()
+                    .lower()
+                    .strip(".\"' ")
+                )
+            except Exception as exc:
+                logger.warning("[stage:verify] check failed: %s", exc)
+                continue
+
+            if verdict not in ("pass", "unsupported", "contradicted"):
+                verdict = "unsupported"
+
+            results.append(
+                {
+                    "source_id": source_id,
+                    "claim_text": claim_text[:2000],
+                    "verdict": verdict,
+                }
+            )
+
+    if results:
+        async with user_connection(db_pool, user_id) as conn:
+            await conn.executemany(
+                """
+                INSERT INTO verification_results (job_id, source_id,
+                                                  claim_text, verdict)
+                VALUES ($1, $2, $3, $4::verdict_type)
+                """,
+                [
+                    (
+                        uuid.UUID(job_id),
+                        uuid.UUID(item["source_id"]),
+                        item["claim_text"],
+                        item["verdict"],
+                    )
+                    for item in results
+                ],
+            )
+
+    counts: dict[str, int] = {}
+    for item in results:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
 
     return {
-        "markdown": markdown_doc,
-        "document_url": document_url,
+        "verified_claims_count": len(results),
+        "verdict_counts": counts,
+        "orphaned_citations": orphaned,
+        "results": results,
+        "note": f"Checked {len(results)} claims",
+    }
+
+
+# ── Stage 5: Style ────────────────────────────────────────────
+
+STYLE_PROMPT = """You are a precise academic editor.
+
+Rewrite the section below for clarity and academic tone.
+
+Rules:
+1. Cut filler ("it is important to note", "basically", "in order to").
+2. Replace vague attributions ("studies show", "experts say") with a
+   concrete reference, or delete the sentence.
+3. Tighten passive voice where an active form is clearer.
+4. Keep every [cite: ...] tag exactly as written — do not add, remove,
+   reorder, or reformat them.
+5. Add no new claims or information.
+
+SECTION: {header}
+
+TEXT:
+{content}
+
+Return only the rewritten text."""
+
+
+async def run_style(job_id: str, ctx: dict) -> dict:
+    """Clarity pass that must not disturb the citation tags."""
+    provider_pool = ctx["provider_pool"]
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
+
+    async with user_connection(db_pool, user_id) as conn:
+        draft = await _stage_output(conn, job_id, "draft")
+
+    if not draft or not draft.get("sections"):
+        raise ValueError("Missing drafted sections to style")
+
+    styled_sections: list[dict] = []
+    edits = 0
+    rejected = 0
+
+    for section in draft["sections"]:
+        content = (section.get("content") or "").strip()
+        if section.get("status") == "failed" or not content:
+            styled_sections.append(section)
+            continue
+
+        header = section.get("header", "")
+        content = section["content"]
+        before_tags = CITE_PATTERN.findall(content)
+
+        try:
+            candidate = (
+                await provider_pool.call(
+                    STYLE_PROMPT.format(header=header, content=content),
+                    tier="cheap",
+                )
+            ).strip()
+        except Exception as exc:
+            logger.warning("[stage:style] rewrite failed for %r: %s", header, exc)
+            styled_sections.append(section)
+            continue
+
+        after_tags = CITE_PATTERN.findall(candidate)
+        # A rewrite that drops or invents citations is worse than no rewrite.
+        if not candidate or sorted(after_tags) != sorted(before_tags):
+            rejected += 1
+            logger.warning(
+                "[stage:style] rejected rewrite for %r (citations changed)",
+                header,
+            )
+            styled_sections.append(section)
+            continue
+
+        edits += 1
+        styled_sections.append(
+            {
+                "header": header,
+                "content": candidate,
+                "status": section.get("status", "ok"),
+            }
+        )
+
+    return {
+        "sections": styled_sections,
+        "edits_made": edits,
+        "rewrites_rejected": rejected,
+        "note": f"Styled {edits} sections",
+    }
+
+
+# ── Stage 6: Format ───────────────────────────────────────────
+
+
+def _compile_markdown(title: str, sections: list[dict], references: list[dict]) -> str:
+    parts = [f"# {title}\n"]
+    for section in sections:
+        if section.get("status") == "failed":
+            continue
+        parts.append(f"## {section['header']}\n")
+        parts.append(f"{section['content']}\n")
+    if references:
+        parts.append("## References\n")
+        for index, ref in enumerate(references, 1):
+            line = f"[{index}] {ref.get('title') or 'Untitled'}"
+            if ref.get("url"):
+                line += f". {ref['url']}"
+            parts.append(line)
+    return "\n".join(parts).strip() + "\n"
+
+
+async def run_format(job_id: str, ctx: dict) -> dict:
+    """Number citations, compile Markdown, and render the DOCX."""
+    db_pool = ctx["db_pool"]
+    user_id = ctx["user_id"]
+    settings = get_settings()
+
+    async with user_connection(db_pool, user_id) as conn:
+        job = await _load_job(conn, job_id)
+        styled = await _stage_output(conn, job_id, "style")
+        outline = await _stage_output(conn, job_id, "outline")
+        verification = await _stage_output(conn, job_id, "verify")
+        sources = await conn.fetch(
+            "SELECT id, title, url FROM sources WHERE job_id = $1", uuid.UUID(job_id)
+        )
+
+    if not styled or not styled.get("sections"):
+        raise ValueError("Missing styled sections to format")
+
+    title = (outline or {}).get("title") or job["topic"]
+    references = [
+        {"id": str(row["id"]), "title": row["title"], "url": row["url"]}
+        for row in sources
+    ]
+
+    sections, ordered_refs, unresolved = number_citations(
+        styled["sections"], references
+    )
+
+    verification_section = build_verification_section(
+        (verification or {}).get("results", [])
+    )
+    if verification_section:
+        sections = sections + [verification_section]
+
+    markdown = _compile_markdown(title, sections, ordered_refs)
+
+    payload = {
+        "job_id": job_id,
+        "title": title,
+        "sections": [
+            {"header": s["header"], "body": s.get("content", "")}
+            for s in sections
+            if s.get("status") != "failed"
+        ],
+        "citation_style": job.get("citation_style") or "apa",
+        "references": ordered_refs,
+    }
+
+    render_status = "skipped"
+    document_id = None
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.render_timeout_seconds) as client:
+            response = await client.post(
+                f"{settings.render_service_url}/render/docx", json=payload
+            )
+            response.raise_for_status()
+            docx_bytes = response.content
+    except Exception as exc:
+        logger.warning(
+            "[stage:format] render service unavailable (%s) — "
+            "delivering Markdown only",
+            exc,
+        )
+        render_status = "fallback_markdown"
+        docx_bytes = None
+
+    if docx_bytes:
+        filename = f"humanoid_{job_id[:8]}.docx"
+        async with user_connection(db_pool, user_id) as conn:
+            document_id = await conn.fetchval(
+                """
+                INSERT INTO documents (job_id, kind, filename, mime_type,
+                                       content, byte_size)
+                VALUES ($1, 'docx', $2, $3, $4, $5)
+                ON CONFLICT (job_id, kind) DO UPDATE
+                   SET content = EXCLUDED.content,
+                       byte_size = EXCLUDED.byte_size,
+                       filename = EXCLUDED.filename
+                RETURNING id
+                """,
+                uuid.UUID(job_id),
+                filename,
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document",
+                docx_bytes,
+                len(docx_bytes),
+            )
+        render_status = "ok"
+
+    return {
+        "markdown": markdown,
+        "title": title,
+        "document_id": str(document_id) if document_id else None,
         "render_status": render_status,
-        "note": "Compiled into markdown"
-        + (" + DOCX" if document_url else " (render unavailable)"),
+        "citations": len(ordered_refs),
+        "unresolved_citations": unresolved,
+        "flagged_claims": len((verification or {}).get("results", [])),
+        "note": (
+            f"Compiled {len(sections)} sections, {len(ordered_refs)} citations"
+            + (" + DOCX" if document_id else " (DOCX render unavailable)")
+        ),
     }
