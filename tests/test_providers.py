@@ -101,3 +101,17 @@ async def test_tier_falls_back_when_preferred_tier_is_parked():
     pool = ProviderPool(providers=[cheap, premium])
 
     assert await pool.call("hi", tier="premium") == "cheap:hi"
+
+
+async def test_failure_is_counted_once_per_call():
+    """The provider marks its own failure; the pool must not add a second one.
+
+    Double counting parks a provider after one error instead of the configured
+    threshold, which silently removes it from the pool.
+    """
+    flaky = MockProvider("flaky", failures=1)
+    pool = ProviderPool(providers=[flaky])
+
+    assert await pool.call("hello") == "flaky:hello"
+    assert flaky.status.consecutive_failures == 0
+    assert flaky.status.failures == 1
