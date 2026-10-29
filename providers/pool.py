@@ -116,7 +116,7 @@ class ProviderPool:
                     # Bad credentials: park this provider, try the next one.
                     fatal_errors += 1
                     last_error = exc
-                    provider.mark_failure(str(exc))
+                    provider.record_error(str(exc))
                     self._cool_down(provider, FATAL_COOLDOWN_SECONDS, "fatal error")
                     logger.error(
                         "[ProviderPool] %s fatal: %s", provider.name, exc
@@ -125,7 +125,7 @@ class ProviderPool:
 
                 except ProviderError as exc:
                     last_error = exc
-                    provider.mark_failure(str(exc))
+                    provider.record_error(str(exc))
                     logger.warning(
                         "[ProviderPool] %s failed (attempt %d/%d): %s",
                         provider.name,
