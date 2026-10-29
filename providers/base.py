@@ -1,8 +1,13 @@
 """Abstract base class for LLM providers."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now (datetime.utcnow() is deprecated)."""
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -14,6 +19,10 @@ class ProviderStatus:
     consecutive_failures: int = 0
     last_failure_time: datetime | None = None
     cooldown_until: datetime | None = None
+    last_error: str | None = None
+    calls: int = 0
+    failures: int = 0
+    extra: dict = field(default_factory=dict)
 
 
 class Provider(ABC):
@@ -28,33 +37,46 @@ class Provider(ABC):
     async def complete(self, prompt: str, **kwargs) -> str:
         """Send a prompt and return the completion text.
 
-        Args:
-            prompt: The user/system prompt to complete.
-            **kwargs: Provider-specific parameters (temperature, max_tokens, etc.)
-
-        Returns:
-            The model's response text.
-
         Raises:
             ProviderError: On retryable errors (429, 5xx).
             ProviderFatalError: On non-retryable errors (auth, bad request).
         """
-        ...
+
+    async def complete_json(self, prompt: str, **kwargs) -> str:
+        """Request a JSON-shaped completion.
+
+        Providers that support native JSON mode override this; the default
+        keeps the same contract so callers need not care.
+        """
+        return await self.complete(prompt, **kwargs)
 
     def mark_success(self) -> None:
         """Reset failure tracking after a successful call."""
         self.status.consecutive_failures = 0
         self.status.is_available = True
         self.status.cooldown_until = None
+        self.status.calls += 1
 
-    def mark_failure(self) -> None:
+    def record_error(self, error: str) -> None:
+        """Store the last error without touching the failure count.
+
+        Provider implementations already call ``mark_failure`` before raising,
+        so counting the same failure again in the pool would park a provider
+        after one real error instead of the configured threshold.
+        """
+        self.status.last_error = error
+
+    def mark_failure(self, error: str | None = None) -> None:
         """Record a failure and potentially trigger cooldown."""
         self.status.consecutive_failures += 1
-        self.status.last_failure_time = datetime.utcnow()
+        self.status.failures += 1
+        self.status.last_failure_time = utcnow()
+        if error:
+            self.status.last_error = error
 
 
 class ProviderError(Exception):
-    """Retryable provider error (429, 5xx)."""
+    """Retryable provider error (429, 5xx, timeouts)."""
 
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
@@ -64,4 +86,6 @@ class ProviderError(Exception):
 class ProviderFatalError(Exception):
     """Non-retryable provider error (auth failure, bad request)."""
 
-    pass
+
+class ProviderExhaustedError(ProviderError):
+    """Every provider in the pool failed."""

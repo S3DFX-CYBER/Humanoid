@@ -1,40 +1,59 @@
 """Vector embeddings for pgvector source storage."""
 
 import logging
-import google.generativeai as genai
+
+from google import genai
+from google.genai import types
+
 from api.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
-async def generate_embedding(text: str) -> list[float]:
-    """Generate a 384-dimensional text embedding for the given text."""
-    # We must output exactly 384 dimensions to match `vector(384)` in schema.sql
-    DIMENSIONS = 384
+async def generate_embedding(text: str) -> list[float] | None:
+    """Generate an embedding for ``text``, or ``None`` if unavailable.
 
+    Returning ``None`` (and storing SQL NULL) is deliberate: a zero-vector
+    fallback makes every source look identical to a similarity search, which
+    silently corrupts retrieval instead of failing visibly.
+    """
     settings = get_settings()
-    api_key = getattr(settings, "gemini_api_key", None)
-
-    if not api_key or api_key == "missing_key":
+    api_key = settings.gemini_api_key
+    if not api_key:
         logger.warning(
-            "[embedding] No Gemini API key provided. Falling back to zero-vector stub."
+            "[embedding] GEMINI_API_KEY is not set — storing sources without "
+            "embeddings. Semantic search will be unavailable for this job."
         )
-        return [0.0] * DIMENSIONS
+        return None
+
+    trimmed = text[:8000]
 
     try:
-        genai.configure(api_key=api_key)
-
-        # text-embedding-004 natively supports output_dimensionality
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text,
-            task_type="retrieval_document",
-            output_dimensionality=DIMENSIONS,
+        client = genai.Client(api_key=api_key)
+        response = await client.aio.models.embed_content(
+            model=settings.embedding_model,
+            contents=trimmed,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_DOCUMENT",
+                output_dimensionality=settings.embedding_dimensions,
+            ),
         )
-        return result["embedding"]
+    except Exception as exc:
+        logger.error("[embedding] Gemini embed failed: %s", exc)
+        return None
 
-    except Exception as e:
+    embeddings = getattr(response, "embeddings", None) or []
+    if not embeddings:
+        logger.error("[embedding] Gemini returned no embeddings")
+        return None
+
+    vector = list(embeddings[0].values or [])
+    if len(vector) != settings.embedding_dimensions:
         logger.error(
-            f"[embedding] Gemini embed failed: {e}. Falling back to zero-vector stub."
+            "[embedding] expected %d dimensions, got %d — dropping vector",
+            settings.embedding_dimensions,
+            len(vector),
         )
-        return [0.0] * DIMENSIONS
+        return None
+
+    return vector

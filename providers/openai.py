@@ -1,47 +1,70 @@
 """OpenAI provider implementation."""
 
 import logging
+
 from openai import AsyncOpenAI
-from providers.base import Provider
-from api.config import get_settings
+
+from providers.base import Provider, ProviderError, ProviderFatalError
 
 logger = logging.getLogger(__name__)
 
+FATAL_MARKERS = ("401", "403", "invalid_api_key", "insufficient_quota")
+RATE_MARKERS = ("429", "rate limit")
+
 
 class OpenAIProvider(Provider):
-    """OpenAI API provider for LLM completion."""
+    """OpenAI chat-completions provider."""
 
-    def __init__(self, model_name: str = "gpt-4o-mini"):
-        super().__init__("openai")
-        self.model_name = model_name
-        self.client: AsyncOpenAI | None = None
-        self._init_client()
-
-    def _init_client(self) -> None:
-        """Initialize the OpenAI client with API key from settings."""
-        settings = get_settings()
-        # Fall back to a dummy key and let the client fail naturally.
-        api_key = getattr(settings, "openai_api_key", "missing_key")
-
-        try:
-            self.client = AsyncOpenAI(api_key=api_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize OpenAI client: {e}")
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o-mini",
+        tier: str = "cheap",
+    ):
+        super().__init__(name="openai", tier=tier)
+        if not api_key:
+            raise ValueError("OpenAIProvider requires an api_key")
+        self.model_name = model
+        self._client = AsyncOpenAI(api_key=api_key, timeout=90.0, max_retries=0)
 
     async def complete(self, prompt: str, **kwargs) -> str:
-        """Generate a completion using OpenAI's chat API."""
-        if not self.client:
-            raise Exception("OpenAI client not initialized")
+        """Generate a plain-text completion."""
+        return await self._generate(prompt, json_mode=False, **kwargs)
 
-        logger.info(f"[openai] Calling completion (model={self.model_name})")
+    async def complete_json(self, prompt: str, **kwargs) -> str:
+        """Generate a JSON-mode completion."""
+        return await self._generate(prompt, json_mode=True, **kwargs)
 
-        response = await self.client.chat.completions.create(
-            model=kwargs.get("model", self.model_name),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get("temperature", 0.7),
-        )
+    async def _generate(self, prompt: str, json_mode: bool, **kwargs) -> str:
+        try:
+            response = await self._client.chat.completions.create(
+                model=kwargs.get("model", self.model_name),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=kwargs.get("temperature", 0.4 if json_mode else 0.7),
+                max_tokens=kwargs.get("max_tokens", 8192),
+                response_format=(
+                    {"type": "json_object"} if json_mode else {"type": "text"}
+                ),
+            )
+        except Exception as exc:
+            message = str(exc)
+            self.mark_failure(message)
+            lowered = message.lower()
+            if any(marker in lowered for marker in FATAL_MARKERS):
+                raise ProviderFatalError(f"OpenAI auth error: {message}") from exc
+            status_code = 429 if any(m in lowered for m in RATE_MARKERS) else None
+            raise ProviderError(
+                f"OpenAI error: {message}", status_code=status_code
+            ) from exc
 
         if not response.choices:
-            raise Exception("No completions returned from OpenAI")
+            self.mark_failure("no choices")
+            raise ProviderError("OpenAI returned no completions")
 
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if not content.strip():
+            self.mark_failure("empty content")
+            raise ProviderError("OpenAI returned an empty completion")
+
+        self.mark_success()
+        return content
