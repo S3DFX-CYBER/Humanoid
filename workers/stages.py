@@ -281,7 +281,7 @@ INSTRUCTIONS:
             )
             failed_sections.append(section_outline)
 
-    result = {
+    result: dict = {
         "sections": drafted_sections,
         "note": f"Drafted {len(drafted_sections)} sections",
     }

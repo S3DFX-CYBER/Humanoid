@@ -57,6 +57,15 @@ class Provider(ABC):
         self.status.cooldown_until = None
         self.status.calls += 1
 
+    def record_error(self, error: str) -> None:
+        """Store the last error without touching the failure count.
+
+        Provider implementations already call ``mark_failure`` before raising,
+        so counting the same failure again in the pool would park a provider
+        after one real error instead of the configured threshold.
+        """
+        self.status.last_error = error
+
     def mark_failure(self, error: str | None = None) -> None:
         """Record a failure and potentially trigger cooldown."""
         self.status.consecutive_failures += 1

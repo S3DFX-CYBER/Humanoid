@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
