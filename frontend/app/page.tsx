@@ -1,298 +1,235 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-/* ═══════════════════════════════════════════════════════════════
-   Humanoid — Main Chat Interface
-   Status text maps 1:1 to job_stage values from DB.
-   ═══════════════════════════════════════════════════════════════ */
+import { DocumentPanel } from "../components/DocumentPanel";
+import { SignInForm } from "../components/SignInForm";
+import { StageList } from "../components/StageList";
+import { api, DEV_MODE, getEmail, getToken, type JobStatus } from "../lib/api";
+import { useResearchJob } from "../lib/useResearchJob";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
-// Maps directly to DB job_status enum
-const STATUS_LABELS: Record<string, string> = {
-    queued: "QUEUED",
-    researching: "RESEARCHING SOURCES...",
-    outlining: "GENERATING OUTLINE...",
-    drafting: "DRAFTING SECTIONS...",
-    verifying: "VERIFYING CLAIMS...",
-    styling: "STYLE & CLARITY PASS...",
-    formatting: "FORMATTING DOCUMENT...",
-    done: "COMPLETE",
-    failed: "FAILED",
+const STATUS_LABELS: Record<JobStatus, string> = {
+  queued: "Queued",
+  researching: "Researching sources",
+  outlining: "Building the outline",
+  outline_pending_approval: "Waiting for your approval",
+  drafting: "Drafting sections",
+  verifying: "Verifying claims",
+  styling: "Style and clarity pass",
+  formatting: "Formatting the document",
+  done: "Complete",
+  failed: "Stopped",
 };
 
-interface Job {
-    id: string;
-    topic: string;
-    status: string;
-    created_at: string;
-    updated_at: string;
-}
-
-interface LogEntry {
-    timestamp: string;
-    text: string;
-    type: "status" | "info" | "error";
-}
+const EXAMPLES = [
+  "How transformer architectures changed machine translation",
+  "Evidence for and against four-day work weeks",
+  "Cooling efficiency of district energy systems in Indian cities",
+];
 
 export default function Home() {
-    const [topic, setTopic] = useState("");
-    const [currentJob, setCurrentJob] = useState<Job | null>(null);
-    const [logs, setLogs] = useState<LogEntry[]>([]);
-    const [isPolling, setIsPolling] = useState(false);
-    const logEndRef = useRef<HTMLDivElement>(null);
+  const [signedIn, setSignedIn] = useState(DEV_MODE);
+  const [topic, setTopic] = useState("");
+  const [citationStyle, setCitationStyle] = useState("apa");
+  const inputRef = useRef<HTMLInputElement>(null);
 
-    // Auto-scroll log to bottom
-    useEffect(() => {
-        logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [logs]);
+  const { job, stages, error, isRunning, start, retry, reset } = useResearchJob();
 
-    // Poll job status
-    useEffect(() => {
-        if (!currentJob || !isPolling) return;
-        if (currentJob.status === "done" || currentJob.status === "failed") {
-            setIsPolling(false);
-            return;
-        }
+  useEffect(() => {
+    if (DEV_MODE) return;
+    setSignedIn(Boolean(getToken()));
+  }, []);
 
-        const interval = setInterval(async () => {
-            try {
-                const res = await fetch(`${API_BASE}/jobs/${currentJob.id}`);
-                if (!res.ok) return;
-                const job: Job = await res.json();
+  const isDone = job?.status === "done";
+  const hasJob = job !== null;
+  const email = useMemo(() => (signedIn ? getEmail() : null), [signedIn]);
 
-                if (job.status !== currentJob.status) {
-                    const label = STATUS_LABELS[job.status] || job.status.toUpperCase();
-                    setLogs((prev: LogEntry[]) => [
-                        ...prev,
-                        {
-                            timestamp: new Date().toISOString().split("T")[1].split(".")[0],
-                            text: `[${label}]`,
-                            type: job.status === "failed" ? "error" : "status",
-                        },
-                    ]);
-                    setCurrentJob(job);
+  function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    const trimmed = topic.trim();
+    if (trimmed.length < 3 || isRunning) return;
+    setTopic("");
+    void start(trimmed, citationStyle);
+  }
 
-                    if (job.status === "done" || job.status === "failed") {
-                        setIsPolling(false);
-                    }
-                }
-            } catch {
-                // Silently retry on next interval
-            }
-        }, 1500);
+  function handleSignOut() {
+    api.signOut();
+    setSignedIn(false);
+    reset();
+  }
 
-        return () => clearInterval(interval);
-    }, [currentJob, isPolling]);
+  if (!signedIn) {
+    return <SignInForm onSignedIn={() => setSignedIn(true)} />;
+  }
 
-    const handleSubmit = async () => {
-        if (!topic.trim()) return;
+  return (
+    <div className="app-shell">
+      <a className="skip-link" href="#workspace">
+        Skip to workspace
+      </a>
 
-        setLogs([
-            {
-                timestamp: new Date().toISOString().split("T")[1].split(".")[0],
-                text: `> ${topic}`,
-                type: "info",
-            },
-            {
-                timestamp: new Date().toISOString().split("T")[1].split(".")[0],
-                text: "[QUEUED]",
-                type: "status",
-            },
-        ]);
-
-        try {
-            const res = await fetch(`${API_BASE}/jobs`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    topic,
-                    user_id: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", // dev user
-                }),
-            });
-
-            if (!res.ok) {
-                setLogs((prev: LogEntry[]) => [
-                    ...prev,
-                    {
-                        timestamp: new Date().toISOString().split("T")[1].split(".")[0],
-                        text: "[ERROR] Failed to create job",
-                        type: "error",
-                    },
-                ]);
-                return;
-            }
-
-            const job: Job = await res.json();
-            setCurrentJob(job);
-            setIsPolling(true);
-            setTopic("");
-        } catch {
-            setLogs((prev: LogEntry[]) => [
-                ...prev,
-                {
-                    timestamp: new Date().toISOString().split("T")[1].split(".")[0],
-                    text: "[ERROR] Cannot reach API",
-                    type: "error",
-                },
-            ]);
-        }
-    };
-
-    return (
-        <div style={{ display: "flex", minHeight: "100vh" }}>
-            {/* ── Sidebar ──────────────────────────────────── */}
-            <aside className="sidebar">
-                <div style={{ padding: "var(--space-sm) 0" }}>
-                    <h1
-                        className="type-headline-md"
-                        style={{ fontWeight: 700, letterSpacing: "-0.02em" }}
-                    >
-                        HUMANOID
-                    </h1>
-                    <p
-                        className="type-mono-label"
-                        style={{
-                            color: "var(--color-secondary)",
-                            marginTop: "var(--space-base)",
-                        }}
-                    >
-                        RESEARCH ASSISTANT
-                    </p>
-                </div>
-
-                <div className="divider" style={{ margin: "var(--space-sm) 0" }} />
-
-                <nav>
-                    <div className="sidebar-nav-item sidebar-nav-item-active">
-                        Chat
-                    </div>
-                    <div className="sidebar-nav-item">Sources</div>
-                    <div className="sidebar-nav-item">Documents</div>
-                </nav>
-            </aside>
-
-            {/* ── Main Content ─────────────────────────────── */}
-            <main style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-                {/* Header */}
-                <header
-                    style={{
-                        padding: "var(--space-sm) var(--space-md)",
-                        borderBottom: "1px solid var(--color-border)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                    }}
-                >
-                    <span className="type-body-sm" style={{ color: "var(--color-secondary)" }}>
-                        {currentJob
-                            ? `Job: ${currentJob.id.slice(0, 8)}...`
-                            : "New Research"}
-                    </span>
-                    {currentJob && (
-                        <span className="type-mono-label">
-                            {STATUS_LABELS[currentJob.status] || currentJob.status}
-                        </span>
-                    )}
-                </header>
-
-                {/* Chat / Log Area */}
-                <div
-                    style={{
-                        flex: 1,
-                        overflow: "auto",
-                        padding: "var(--space-md)",
-                    }}
-                >
-                    {logs.length === 0 ? (
-                        <div
-                            style={{
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                height: "100%",
-                                flexDirection: "column",
-                                gap: "var(--space-sm)",
-                            }}
-                        >
-                            <h2 className="type-headline-lg">What would you like to research?</h2>
-                            <p
-                                className="type-body-sm"
-                                style={{ color: "var(--color-secondary)", maxWidth: 480, textAlign: "center" }}
-                            >
-                                Enter a topic or research question. Humanoid will find sources,
-                                draft a structured document, verify claims, and format the result
-                                for submission.
-                            </p>
-                        </div>
-                    ) : (
-                        <div style={{ maxWidth: 720 }}>
-                            {logs.map((log, i) => (
-                                <div
-                                    key={i}
-                                    className={
-                                        log.type === "info"
-                                            ? "chat-message chat-message-user"
-                                            : "chat-message chat-message-ai"
-                                    }
-                                >
-                                    <span
-                                        className="type-mono-code"
-                                        style={{
-                                            color:
-                                                log.type === "error"
-                                                    ? "var(--color-on-surface)"
-                                                    : log.type === "status"
-                                                        ? "var(--color-on-surface-variant)"
-                                                        : "var(--color-on-surface)",
-                                            fontWeight: log.type === "error" ? 700 : 400,
-                                        }}
-                                    >
-                                        <span style={{ color: "var(--color-secondary)", marginRight: 8 }}>
-                                            {log.timestamp}
-                                        </span>
-                                        {log.text}
-                                    </span>
-                                </div>
-                            ))}
-                            <div ref={logEndRef} />
-                        </div>
-                    )}
-                </div>
-
-                {/* Input Area */}
-                <div
-                    style={{
-                        padding: "var(--space-sm) var(--space-md)",
-                        borderTop: "1px solid var(--color-border)",
-                    }}
-                >
-                    <div style={{ display: "flex", gap: "var(--space-xs)", maxWidth: 720 }}>
-                        <input
-                            className="input-field"
-                            type="text"
-                            placeholder="Enter a research topic or question..."
-                            value={topic}
-                            onChange={(e) => setTopic(e.target.value)}
-                            onKeyDown={(e) => {
-                                if (e.key === "Enter") handleSubmit();
-                            }}
-                            disabled={isPolling}
-                            id="research-topic-input"
-                        />
-                        <button
-                            className="btn btn-primary"
-                            onClick={handleSubmit}
-                            disabled={isPolling || !topic.trim()}
-                            id="submit-research-btn"
-                            style={{ whiteSpace: "nowrap" }}
-                        >
-                            {isPolling ? "RUNNING..." : "RESEARCH"}
-                        </button>
-                    </div>
-                </div>
-            </main>
+      <aside className="sidebar">
+        <div>
+          <h1 className="type-headline-md" style={{ fontWeight: 700 }}>
+            HUMANOID
+          </h1>
+          <p className="type-mono-label muted" style={{ marginTop: 4 }}>
+            RESEARCH ASSISTANT
+          </p>
         </div>
-    );
+
+        <div className="divider" style={{ margin: "var(--space-sm) 0" }} />
+
+        <nav aria-label="Sections">
+          <a className="sidebar-nav-item sidebar-nav-item-active" href="#workspace">
+            Research
+          </a>
+          <span className="sidebar-nav-item sidebar-nav-item-disabled">
+            Sources
+            <span className="type-mono-label">SOON</span>
+          </span>
+          <span className="sidebar-nav-item sidebar-nav-item-disabled">
+            Library
+            <span className="type-mono-label">SOON</span>
+          </span>
+        </nav>
+
+        <div className="sidebar-footer">
+          {email && <p className="type-mono-label muted">{email}</p>}
+          {!DEV_MODE && (
+            <button className="btn btn-ghost" type="button" onClick={handleSignOut}>
+              Sign out
+            </button>
+          )}
+          {DEV_MODE && (
+            <p className="type-mono-label muted">DEV MODE · AUTH BYPASSED</p>
+          )}
+        </div>
+      </aside>
+
+      <main id="workspace" className="workspace">
+        <header className="workspace-header">
+          <div>
+            <p className="type-mono-label muted">
+              {hasJob ? `JOB ${job.id.slice(0, 8)}` : "NEW RESEARCH"}
+            </p>
+            <p className="type-body-sm" style={{ marginTop: 4 }}>
+              {hasJob ? job.topic : "Describe what you want researched."}
+            </p>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-sm)" }}>
+            {hasJob && (
+              <span className="type-mono-label" aria-live="polite">
+                {STATUS_LABELS[job.status]}
+              </span>
+            )}
+            {hasJob && !isRunning && (
+              <button className="btn btn-secondary" type="button" onClick={reset}>
+                New research
+              </button>
+            )}
+          </div>
+        </header>
+
+        <div className="workspace-body">
+          {!hasJob && (
+            <section className="empty-state">
+              <h2 className="type-headline-lg">What should we research?</h2>
+              <p className="type-body-sm muted empty-state-copy">
+                Humanoid finds sources, drafts a structured document, checks
+                every claim against its citation, and hands you a finished file.
+              </p>
+
+              <ul className="example-list">
+                {EXAMPLES.map((example) => (
+                  <li key={example}>
+                    <button
+                      className="example-chip"
+                      type="button"
+                      onClick={() => {
+                        setTopic(example);
+                        inputRef.current?.focus();
+                      }}
+                    >
+                      {example}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {hasJob && (
+            <div className="result-column">
+              <StageList stages={stages} />
+
+              {job.status === "failed" && (
+                <div className="banner banner-error" role="alert">
+                  <p>{error ?? "This job stopped before finishing."}</p>
+                  <button className="btn btn-secondary" type="button" onClick={() => void retry()}>
+                    Continue from the last completed step
+                  </button>
+                </div>
+              )}
+
+              {error && job.status !== "failed" && (
+                <p className="banner banner-error" role="alert">
+                  {error}
+                </p>
+              )}
+
+              <DocumentPanel jobId={job.id} isDone={isDone} />
+            </div>
+          )}
+        </div>
+
+        <form className="composer" onSubmit={handleSubmit}>
+          <label className="input-label" htmlFor="research-topic">
+            Research topic
+          </label>
+
+          <div className="composer-row">
+            <input
+              id="research-topic"
+              ref={inputRef}
+              className="input-field"
+              type="text"
+              placeholder="e.g. How do retrieval-augmented models reduce hallucination?"
+              value={topic}
+              onChange={(event) => setTopic(event.target.value)}
+              disabled={isRunning}
+              maxLength={500}
+              autoComplete="off"
+            />
+
+            <label className="sr-only" htmlFor="citation-style">
+              Citation style
+            </label>
+            <select
+              id="citation-style"
+              className="input-field select-field"
+              value={citationStyle}
+              onChange={(event) => setCitationStyle(event.target.value)}
+              disabled={isRunning}
+            >
+              <option value="apa">APA</option>
+              <option value="mla">MLA</option>
+              <option value="chicago">Chicago</option>
+              <option value="ieee">IEEE</option>
+            </select>
+
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={isRunning || topic.trim().length < 3}
+              aria-busy={isRunning}
+            >
+              {isRunning ? "Researching…" : "Start research"}
+            </button>
+          </div>
+        </form>
+      </main>
+    </div>
+  );
 }
