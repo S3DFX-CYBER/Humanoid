@@ -1,18 +1,27 @@
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-# System deps for file parsing (Phase 0 stubs don't need these yet,
-# but the container is ready for real parsers)
+# tesseract for OCR. libgl1-mesa-glx no longer exists in Debian 12 — the
+# current package names are libgl1 and libglx-mesa0.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglx-mesa0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .
+COPY pyproject.toml ./
+COPY ingestion ./ingestion
 RUN pip install --no-cache-dir ".[ingestion]"
 
-COPY ingestion/ ./ingestion/
+RUN useradd --create-home --uid 10002 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
-# Ingestion service runs on port 8001
+EXPOSE 8001
+
 CMD ["uvicorn", "ingestion.main:app", "--host", "0.0.0.0", "--port", "8001"]
