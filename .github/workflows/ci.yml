@@ -55,8 +55,11 @@ jobs:
           pip install -e ".[dev,render]"
 
       - name: Apply schema
-        run: psql -h localhost -U humanoid -d humanoid -v ON_ERROR_STOP=1 \
-          -f db/schema.sql
+        env:
+          PGPASSWORD: humanoid
+        # Single line on purpose: a trailing backslash inside a YAML block
+        # scalar is folded away, which silently dropped the -f argument.
+        run: psql -h localhost -U humanoid -d humanoid -v ON_ERROR_STOP=1 -f db/schema.sql
 
       - name: Lint
         run: flake8 api workers providers ingestion render tests
