@@ -5,8 +5,12 @@
  * token is optional and NEXT_PUBLIC_DEV_MODE skips the sign-in screen.
  */
 
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
+
+/** True when the build was given an API URL. False means localhost fallback. */
+export const API_CONFIGURED = CONFIGURED_API_URL.length > 0;
+
+export const API_BASE = CONFIGURED_API_URL || "http://localhost:8000";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
@@ -97,7 +101,15 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       cache: "no-store",
     });
   } catch {
-    throw new ApiError(0, "Cannot reach the Humanoid API. Is it running?");
+    const deployed =
+      typeof window !== "undefined" &&
+      !["localhost", "127.0.0.1"].includes(window.location.hostname);
+    throw new ApiError(
+      0,
+      !API_CONFIGURED && deployed
+        ? "This deployment has no NEXT_PUBLIC_API_URL set, so it is trying to reach localhost. Set it in the hosting project's environment variables and redeploy."
+        : "Cannot reach the Humanoid API. Is it running?",
+    );
   }
 
   if (!response.ok) {

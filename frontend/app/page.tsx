@@ -1,5 +1,11 @@
 "use client";
 
+/* Rendered at build time. Everything on this screen is client-side, so there is
+ * no reason to pay for a serverless invocation — and no function left to fail.
+ * A missing env var or a cold-start crash therefore cannot take the page down.
+ */
+export const dynamic = "force-static";
+
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DocumentPanel } from "../components/DocumentPanel";
